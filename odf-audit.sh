@@ -117,13 +117,17 @@ collect_ceph_cluster() {
 
     subsection "Top pools by usage"
     jq -r '
-        (.pools // [])[]
-        | { name:(.name // "unknown"), kb:(
-            if (.stats.kb_used? != null) then (.stats.kb_used | tonumber)
-            elif (.stats.bytes_used? != null) then ((.stats.bytes_used | tonumber)/1024)
-            elif (.stats.stored? != null) then ((.stats.stored | tonumber)/1024)
-            else 0 end) }
-        | [ .name, (.kb/1024) ]
+        def pool_entries:
+            (.pools // []) | map({
+                pool_name:(.name // "unknown"),
+                bytes_used:(
+                    if (.stats.bytes_used? != null) then (.stats.bytes_used | tonumber)
+                    elif (.stats.kb_used? != null) then (.stats.kb_used | tonumber) * 1024
+                    elif (.stats.stored? != null) then (.stats.stored | tonumber)
+                    else 0 end)
+            });
+        pool_entries[]
+        | [ .pool_name, (.bytes_used/1024/1024) ]
         | @tsv
     ' "$POOL_STATS_JSON" \
         | sort -k2 -n -r | head -10 \
@@ -309,17 +313,17 @@ build_orphans_json() {
         'def pool_entries($p):
             ($p.pools // []) | map({
                 pool_name:(.name // "unknown"),
-                kb_used:(
-                    if (.stats.kb_used? != null) then (.stats.kb_used | tonumber)
-                    elif (.stats.bytes_used? != null) then ((.stats.bytes_used | tonumber)/1024)
-                    elif (.stats.stored? != null) then ((.stats.stored | tonumber)/1024)
+                bytes_used:(
+                    if (.stats.bytes_used? != null) then (.stats.bytes_used | tonumber)
+                    elif (.stats.kb_used? != null) then (.stats.kb_used | tonumber) * 1024
+                    elif (.stats.stored? != null) then (.stats.stored | tonumber)
                     else 0 end)
             });
         {
             rbd: [ $rbd[] | select(.has_pv | not) ],
             rgw: [ $rgw[] | select(.has_obc | not) ],
             loki_buckets: [ $rgw[] | select(.tags.loki == true) ],
-            suspected_pools: [ pool_entries($pools)[] | select((.pool_name // .name // "") | test("(test|bench|perf|fio|tmp|temp)", "i")) | {name:(.pool_name // .name // "unknown"),kb_used:(.kb_used // .stats.kb_used // 0)} ]
+            suspected_pools: [ pool_entries($pools)[] | select((.pool_name // "") | test("(test|bench|perf|fio|tmp|temp)", "i")) | {name:(.pool_name // "unknown"),kb_used:(.bytes_used/1024)} ]
         }' > "$orphan_json"
 }
 
@@ -340,10 +344,15 @@ build_report_json() {
         'def pool_entries($p):
             ($p.pools // []) | map({
                 pool_name:(.name // "unknown"),
+                bytes_used:(
+                    if (.stats.bytes_used? != null) then (.stats.bytes_used | tonumber)
+                    elif (.stats.kb_used? != null) then (.stats.kb_used | tonumber) * 1024
+                    elif (.stats.stored? != null) then (.stats.stored | tonumber)
+                    else 0 end),
                 kb_used:(
-                    if (.stats.kb_used? != null) then (.stats.kb_used | tonumber)
-                    elif (.stats.bytes_used? != null) then ((.stats.bytes_used | tonumber)/1024)
-                    elif (.stats.stored? != null) then ((.stats.stored | tonumber)/1024)
+                    if (.stats.bytes_used? != null) then (.stats.bytes_used | tonumber) / 1024
+                    elif (.stats.kb_used? != null) then (.stats.kb_used | tonumber)
+                    elif (.stats.stored? != null) then (.stats.stored | tonumber) / 1024
                     else 0 end)
             });
         {
