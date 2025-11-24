@@ -186,7 +186,8 @@ query_prometheus() {
     local response
     local curl_exit_code
 
-    log_info "Querying Prometheus: $query"
+    # Note: Don't log here as output is redirected to files
+    # log_info "Querying Prometheus: $query"
 
     while [[ $retry -lt $max_retries ]]; do
         if [[ -n "$PROMETHEUS_TOKEN" ]]; then
@@ -210,21 +211,12 @@ query_prometheus() {
 
         # Check if response is valid JSON and has data
         if echo "$response" | jq -e '.status == "success"' >/dev/null 2>&1; then
-            log_info "  ✓ Query successful"
+            # Success - output only JSON (no logs, as stdout is redirected to file)
             echo "$response"
             return 0
         fi
         
-        # Check if it's valid JSON but with error status
-        if echo "$response" | jq -e '.status' >/dev/null 2>&1; then
-            local error_msg
-            error_msg=$(echo "$response" | jq -r '.error // "unknown error"')
-            log_info "  Attempt $((retry+1))/$max_retries: Prometheus returned error: $error_msg"
-        else
-            log_info "  Attempt $((retry+1))/$max_retries: Invalid JSON response"
-        fi
-
-        log_info "  Attempt $((retry+1))/$max_retries: Invalid response"
+        # Failed - log to stderr (not stdout which goes to file)
         ((retry++))
         if [[ $retry -lt $max_retries ]]; then
             sleep 2
