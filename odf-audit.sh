@@ -339,7 +339,7 @@ build_orphans_json() {
             rbd: [ $rbd[] | select(.has_pv | not) ],
             rgw: [ $rgw[] | select(.has_obc | not) ],
             loki_buckets: [ $rgw[] | select(.tags.loki == true) ],
-            suspected_pools: [ pool_entries($pools)[] | select((.pool_name // "") | test("(test|bench|perf|fio|tmp|temp)", "i")) | {name:(.pool_name // "unknown"),kb_used:(.bytes_used/1024/1024)} ]
+            suspected_pools: [ pool_entries($pools)[] | select((.pool_name // "") | test("(test|bench|perf|fio|tmp|temp)", "i")) | {name:(.pool_name // "unknown"),size_mib:(.bytes_used/1024/1024)} ]
         }' > "$orphan_json"
 }
 
@@ -427,7 +427,7 @@ print_cleanup_hints() {
     section "Potential cleanup candidates"
     jq -r '.orphans.rbd[]? | "RBD orphan: \(.pool)/\(.image) size \(.size_human)"' "$JSON_FILE" | sed 's/^/  - /' | tee -a "$REPORT_FILE"
     jq -r '.orphans.rgw[]? | "RGW bucket without OBC: \(.name) size " + (.size_bytes | tostring)' "$JSON_FILE" | sed 's/^/  - /' | tee -a "$REPORT_FILE"
-    jq -r '.orphans.suspected_pools[]? | "Suspect pool: \(.name) (kb_used=\(.kb_used))"' "$JSON_FILE" | sed 's/^/  - /' | tee -a "$REPORT_FILE"
+    jq -r '.orphans.suspected_pools[]? | "Suspect pool: \(.name) (size=\(.size_mib) MiB)"' "$JSON_FILE" | sed 's/^/  - /' | tee -a "$REPORT_FILE"
 }
 
 main() {
