@@ -26,7 +26,7 @@ if [[ ! -d "$AUDIT_DIR" ]]; then
     exit 1
 fi
 
-POOLS_JSON="$DATA_DIR/rados-df.json"
+POOLS_JSON="$DATA_DIR/ceph-df-detail.json"
 RBD_JSON="$DATA_DIR/rbd-images.json"
 RGW_JSON="$DATA_DIR/rgw-buckets.json"
 PVC_JSON="$DATA_DIR/pvc.json"
@@ -42,18 +42,25 @@ echo "" | tee -a "$REPORT_FILE"
 print_pools() {
     echo "=== 1. POOLS BY SIZE (Largest First) ===" | tee -a "$REPORT_FILE"
     if [[ -f "$POOLS_JSON" ]]; then
-        jq -r '
+        local total_cluster_bytes
+        total_cluster_bytes=$(jq '.stats.total_bytes // 0' "$POOLS_JSON" 2>/dev/null || echo "0")
+        jq -r --argjson total_bytes "$total_cluster_bytes" '
+            def normalize_bytes(val):
+                val as $v
+                | if ($v == 0 or $v == null) then 0
+                  elif ($total_bytes > 0 and $v > $total_bytes) then ($v * 1024)
+                  else $v end;
             def pool_entries:
                 (.pools // []) | map({
                     pool_name:(.name // "unknown"),
                     bytes_used:(
-                        if (.stats.bytes_used? != null) then (.stats.bytes_used | tonumber)
+                        if (.stats.bytes_used? != null) then normalize_bytes(.stats.bytes_used | tonumber)
                         elif (.stats.kb_used? != null) then (.stats.kb_used | tonumber) * 1024
-                        elif (.stats.stored? != null) then (.stats.stored | tonumber)
+                        elif (.stats.stored? != null) then normalize_bytes(.stats.stored | tonumber)
                         else 0 end)
                 });
             pool_entries[]
-            | [(.pool_name), (.bytes_used / 1024 / 1024)]
+            | [ .pool_name, (.bytes_used/1024/1024) ]
             | @tsv
         ' "$POOLS_JSON" \
             | sort -k2 -n -r | head -15 \

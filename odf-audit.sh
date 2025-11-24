@@ -116,14 +116,26 @@ collect_ceph_cluster() {
     append_line "Usage: $(human_bytes "$used_bytes") / $(human_bytes "$total_bytes")"
 
     subsection "Top pools by usage"
-    jq -r '
+    local total_cluster_bytes
+    total_cluster_bytes=$(jq '.stats.total_bytes // 0' "$DATA_DIR/ceph-df.json")
+    jq -r --argjson total_bytes "$total_cluster_bytes" '
+        def normalize_bytes(val, field_name):
+            val as $v
+            | if ($v == 0 or $v == null) then 0
+              elif ($total_bytes > 0 and $v > $total_bytes) then
+                  # Value exceeds cluster total - likely in KB, convert to bytes
+                  ($v * 1024)
+              else
+                  # Assume bytes
+                  $v
+              end;
         def pool_entries:
             (.pools // []) | map({
                 pool_name:(.name // "unknown"),
                 bytes_used:(
-                    if (.stats.bytes_used? != null) then (.stats.bytes_used | tonumber)
+                    if (.stats.bytes_used? != null) then normalize_bytes(.stats.bytes_used | tonumber, "bytes_used")
                     elif (.stats.kb_used? != null) then (.stats.kb_used | tonumber) * 1024
-                    elif (.stats.stored? != null) then (.stats.stored | tonumber)
+                    elif (.stats.stored? != null) then normalize_bytes(.stats.stored | tonumber, "stored")
                     else 0 end)
             });
         pool_entries[]
@@ -310,20 +322,24 @@ build_orphans_json() {
         --argfile rbd "$DATA_DIR/rbd-images.json" \
         --argfile rgw "$DATA_DIR/rgw-buckets.json" \
         --argfile pools "$pools_json" \
-        'def pool_entries($p):
+        'def normalize_bytes($val, $total_bytes):
+            if ($val == 0 or $val == null) then 0
+            elif ($total_bytes > 0 and $val > $total_bytes) then ($val * 1024)
+            else $val end;
+        def pool_entries($p):
             ($p.pools // []) | map({
                 pool_name:(.name // "unknown"),
                 bytes_used:(
-                    if (.stats.bytes_used? != null) then (.stats.bytes_used | tonumber)
+                    if (.stats.bytes_used? != null) then normalize_bytes(.stats.bytes_used | tonumber, $p.stats.total_bytes // 0)
                     elif (.stats.kb_used? != null) then (.stats.kb_used | tonumber) * 1024
-                    elif (.stats.stored? != null) then (.stats.stored | tonumber)
+                    elif (.stats.stored? != null) then normalize_bytes(.stats.stored | tonumber, $p.stats.total_bytes // 0)
                     else 0 end)
             });
         {
             rbd: [ $rbd[] | select(.has_pv | not) ],
             rgw: [ $rgw[] | select(.has_obc | not) ],
             loki_buckets: [ $rgw[] | select(.tags.loki == true) ],
-            suspected_pools: [ pool_entries($pools)[] | select((.pool_name // "") | test("(test|bench|perf|fio|tmp|temp)", "i")) | {name:(.pool_name // "unknown"),kb_used:(.bytes_used/1024)} ]
+            suspected_pools: [ pool_entries($pools)[] | select((.pool_name // "") | test("(test|bench|perf|fio|tmp|temp)", "i")) | {name:(.pool_name // "unknown"),kb_used:(.bytes_used/1024/1024)} ]
         }' > "$orphan_json"
 }
 
@@ -341,18 +357,17 @@ build_report_json() {
         --argfile pvc "$DATA_DIR/pvc.json" \
         --argfile obc "$DATA_DIR/obc.json" \
         --argfile orphans "$DATA_DIR/orphans.json" \
-        'def pool_entries($p):
+        'def normalize_bytes($val, $total_bytes):
+            if ($val == 0 or $val == null) then 0
+            elif ($total_bytes > 0 and $val > $total_bytes) then ($val * 1024)
+            else $val end;
+        def pool_entries($p):
             ($p.pools // []) | map({
                 pool_name:(.name // "unknown"),
-                bytes_used:(
-                    if (.stats.bytes_used? != null) then (.stats.bytes_used | tonumber)
-                    elif (.stats.kb_used? != null) then (.stats.kb_used | tonumber) * 1024
-                    elif (.stats.stored? != null) then (.stats.stored | tonumber)
-                    else 0 end),
                 kb_used:(
-                    if (.stats.bytes_used? != null) then (.stats.bytes_used | tonumber) / 1024
-                    elif (.stats.kb_used? != null) then (.stats.kb_used | tonumber)
-                    elif (.stats.stored? != null) then (.stats.stored | tonumber) / 1024
+                    if (.stats.kb_used? != null) then (.stats.kb_used | tonumber)
+                    elif (.stats.bytes_used? != null) then (normalize_bytes(.stats.bytes_used | tonumber, $p.stats.total_bytes // 0) / 1024)
+                    elif (.stats.stored? != null) then (normalize_bytes(.stats.stored | tonumber, $p.stats.total_bytes // 0) / 1024)
                     else 0 end)
             });
         {
