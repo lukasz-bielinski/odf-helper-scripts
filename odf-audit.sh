@@ -162,9 +162,42 @@ collect_ceph_cluster() {
             | awk '{printf "  %-35s %12.2f MiB\n", $1, $2/1024/1024}' \
             | tee -a "$REPORT_FILE" || append_line "  (No Prometheus pool data)"
     elif [[ -f "$DATA_DIR/ceph-df-detail.json" ]]; then
-        # Fallback to ceph-df-detail
-        jq -r '.pools[]? | [.name, (.stats.bytes_used // .stats.stored // 0)] | @tsv' \
-            "$DATA_DIR/ceph-df-detail.json" 2>/dev/null \
+        # Fallback to ceph-df-detail - handle multiple Ceph versions
+        local total_cluster_bytes
+        total_cluster_bytes=$(jq '.stats.total_bytes // 0' "$DATA_DIR/ceph-df.json" 2>/dev/null || echo "0")
+        
+        jq -r --argjson total_bytes "$total_cluster_bytes" '
+            # Normalize bytes value based on cluster size to detect KB vs bytes
+            def normalize_bytes(val):
+                val as $v |
+                if ($v == 0 or $v == null) then 0
+                elif ($total_bytes > 0 and $v > $total_bytes * 2) then
+                    # Value exceeds 2x cluster total - likely in KB, convert to bytes
+                    ($v * 1024)
+                else
+                    # Assume bytes
+                    $v
+                end;
+            
+            .pools[]? | 
+            {
+                name: (.name // "unknown"),
+                bytes: (
+                    if (.stats.bytes_used? != null) then 
+                        normalize_bytes(.stats.bytes_used | tonumber)
+                    elif (.stats.num_bytes? != null) then 
+                        normalize_bytes(.stats.num_bytes | tonumber)
+                    elif (.stats.kb_used? != null) then 
+                        (.stats.kb_used | tonumber) * 1024
+                    elif (.stats.stored? != null) then 
+                        normalize_bytes(.stats.stored | tonumber)
+                    else 
+                        0 
+                    end
+                )
+            } |
+            [.name, .bytes] | @tsv
+        ' "$DATA_DIR/ceph-df-detail.json" 2>/dev/null \
             | sort -k2 -n -r | head -10 \
             | awk '{printf "  %-35s %12.2f MiB\n", $1, $2/1024/1024}' \
             | tee -a "$REPORT_FILE" || append_line "  (No pool data available)"
