@@ -214,6 +214,15 @@ query_prometheus() {
             echo "$response"
             return 0
         fi
+        
+        # Check if it's valid JSON but with error status
+        if echo "$response" | jq -e '.status' >/dev/null 2>&1; then
+            local error_msg
+            error_msg=$(echo "$response" | jq -r '.error // "unknown error"')
+            log_info "  Attempt $((retry+1))/$max_retries: Prometheus returned error: $error_msg"
+        else
+            log_info "  Attempt $((retry+1))/$max_retries: Invalid JSON response"
+        fi
 
         log_info "  Attempt $((retry+1))/$max_retries: Invalid response"
         ((retry++))
@@ -231,6 +240,16 @@ query_prometheus() {
     echo "Query: $query" >&2
     echo "Endpoint: $PROMETHEUS_ENDPOINT" >&2
     echo "" >&2
+    
+    # Try to extract error message from Prometheus response
+    if [[ -n "$response" ]] && echo "$response" | jq -e '.error' >/dev/null 2>&1; then
+        local prom_error
+        prom_error=$(echo "$response" | jq -r '.error')
+        echo "Prometheus error message:" >&2
+        echo "  $prom_error" >&2
+        echo "" >&2
+    fi
+    
     echo "Full URL (for manual testing):" >&2
     echo "  $full_url" >&2
     echo "" >&2
@@ -248,11 +267,18 @@ query_prometheus() {
     fi
     echo "" >&2
     if [[ -n "$response" ]]; then
-        echo "Last response:" >&2
-        echo "$response" | head -20 >&2
+        echo "Full response:" >&2
+        echo "$response" >&2
         echo "" >&2
     fi
     echo "curl exit code: $curl_exit_code" >&2
+    echo "" >&2
+    
+    # Common issues help
+    echo "Common issues:" >&2
+    echo "  1. Metric not found: Check if metric exists with 'curl <endpoint>/api/v1/label/__name__/values'" >&2
+    echo "  2. No data: Metric may not be enabled (e.g. ceph_pool_* requires mgr/prometheus/rbd_stats_pools)" >&2
+    echo "  3. Syntax error: Check PromQL syntax" >&2
     echo "" >&2
     exit 1
 }

@@ -103,10 +103,19 @@ collect_ceph_cluster() {
     rook_exec ceph status --format json > "$DATA_DIR/ceph-status.json"
     
     # Collect Prometheus metrics - REQUIRED, no fallback
+    log_line "Querying cluster-level metrics..."
     query_prometheus "sum(ceph_osd_stat_bytes)" > "$DATA_DIR/prom-cluster-total.json"
     query_prometheus "sum(ceph_pool_bytes_used)" > "$DATA_DIR/prom-cluster-used.json"
     query_prometheus "sum(ceph_pool_stored)" > "$DATA_DIR/prom-cluster-stored.json"
-    query_prometheus "ceph_pool_bytes_used" > "$DATA_DIR/prom-pool-bytes-used.json"
+    
+    log_line "Querying pool-level metrics..."
+    if ! query_prometheus "ceph_pool_bytes_used" > "$DATA_DIR/prom-pool-bytes-used.json"; then
+        echo "ERROR: Failed to query ceph_pool_bytes_used" >&2
+        echo "File content:" >&2
+        cat "$DATA_DIR/prom-pool-bytes-used.json" >&2
+        exit 1
+    fi
+    
     query_prometheus "ceph_pool_stored" > "$DATA_DIR/prom-pool-stored.json"
     query_prometheus "ceph_pool_metadata" > "$DATA_DIR/prom-pool-metadata.json"
 
