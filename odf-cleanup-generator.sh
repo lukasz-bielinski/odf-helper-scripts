@@ -54,10 +54,11 @@ cat <<'EOF' >> "$CLEANUP_SCRIPT"
 EOF
 
 if [[ "$JSON_AVAILABLE" == true ]]; then
-    rbd_count=$(jq '.orphans.rbd | length' "$JSON_REPORT")
+    # Use new orphans structure: .orphans.rbd.high_confidence_orphans
+    rbd_count=$(jq '.orphans.rbd.high_confidence_orphans | length' "$JSON_REPORT" 2>/dev/null || echo "0")
     if [[ "$rbd_count" -gt 0 ]]; then
-        echo "# Found potentially orphaned RBD images:" >> "$CLEANUP_SCRIPT"
-        jq -c '.orphans.rbd[]' "$JSON_REPORT" | while read -r row; do
+        echo "# HIGH CONFIDENCE orphaned RBD images (no PV, no watchers):" >> "$CLEANUP_SCRIPT"
+        jq -c '.orphans.rbd.high_confidence_orphans[]' "$JSON_REPORT" | while read -r row; do
             pool=$(echo "$row" | jq -r '.pool')
             image=$(echo "$row" | jq -r '.image')
             size=$(echo "$row" | jq -r '.size_human // "unknown"')
@@ -65,13 +66,26 @@ if [[ "$JSON_AVAILABLE" == true ]]; then
 
 # Image: $pool/$image ($size)
 # Verify not in use: oc rsh -n openshift-storage \$ROOK_TOOLS_POD rbd status $pool/$image
-# Check watchers before deletion!
+# Final check before deletion:
 # oc rsh -n openshift-storage \$ROOK_TOOLS_POD rbd rm $pool/$image
 
 EOF
         done
     else
-        echo "# No orphaned RBD images detected" >> "$CLEANUP_SCRIPT"
+        echo "# No high-confidence orphaned RBD images detected" >> "$CLEANUP_SCRIPT"
+    fi
+    
+    # Add medium confidence (has watchers) as commented warnings
+    rbd_medium=$(jq '.orphans.rbd.no_pv | length' "$JSON_REPORT" 2>/dev/null || echo "0")
+    if [[ "$rbd_medium" -gt "$rbd_count" ]]; then
+        echo "" >> "$CLEANUP_SCRIPT"
+        echo "# MEDIUM CONFIDENCE (manual review required - has watchers or other flags):" >> "$CLEANUP_SCRIPT"
+        jq -c '.orphans.rbd.no_pv[] | select(.watcher_count > 0)' "$JSON_REPORT" 2>/dev/null | while read -r row; do
+            pool=$(echo "$row" | jq -r '.pool')
+            image=$(echo "$row" | jq -r '.image')
+            watchers=$(echo "$row" | jq -r '.watcher_count')
+            echo "# $pool/$image - has $watchers watcher(s) - VERIFY BEFORE CLEANUP" >> "$CLEANUP_SCRIPT"
+        done
     fi
     echo "" >> "$CLEANUP_SCRIPT"
 else
@@ -107,19 +121,37 @@ cat <<'EOF' >> "$CLEANUP_SCRIPT"
 EOF
 
 if [[ "$JSON_AVAILABLE" == true ]]; then
-    jq -c '.orphans.rgw[]?' "$JSON_REPORT" | while read -r row; do
-        bucket=$(echo "$row" | jq -r '.name')
-        size=$(echo "$row" | jq -r '.size_bytes')
-        objects=$(echo "$row" | jq -r '.objects')
-        cat <<EOF >> "$CLEANUP_SCRIPT"
+    # Use new orphans structure: .orphans.rgw.high_confidence_orphans
+    rgw_count=$(jq '.orphans.rgw.high_confidence_orphans | length' "$JSON_REPORT" 2>/dev/null || echo "0")
+    if [[ "$rgw_count" -gt 0 ]]; then
+        echo "# HIGH CONFIDENCE orphaned RGW buckets (no OBC, not Loki/logging):" >> "$CLEANUP_SCRIPT"
+        jq -c '.orphans.rgw.high_confidence_orphans[]' "$JSON_REPORT" | while read -r row; do
+            bucket=$(echo "$row" | jq -r '.name')
+            size=$(echo "$row" | jq -r '.size_bytes')
+            objects=$(echo "$row" | jq -r '.objects')
+            cat <<EOF >> "$CLEANUP_SCRIPT"
 
 # Bucket: $bucket
 # Owner: $(echo "$row" | jq -r '.owner') | Objects: $objects | Size: $(human_bytes "$size")
 # Verify bucket contents: oc rsh -n openshift-storage \$ROOK_TOOLS_POD radosgw-admin bucket stats --bucket=$bucket
 # Delete bucket: oc rsh -n openshift-storage \$ROOK_TOOLS_POD radosgw-admin bucket rm --bucket=$bucket --purge-objects
 EOF
-    done
-    [[ $(jq '.orphans.rgw | length' "$JSON_REPORT") -eq 0 ]] && echo "# No RGW bucket data available" >> "$CLEANUP_SCRIPT"
+        done
+    else
+        echo "# No high-confidence orphaned RGW buckets detected" >> "$CLEANUP_SCRIPT"
+    fi
+    
+    # Add Loki-related buckets as warnings
+    loki_count=$(jq '.orphans.rgw.loki_related | length' "$JSON_REPORT" 2>/dev/null || echo "0")
+    if [[ "$loki_count" -gt 0 ]]; then
+        echo "" >> "$CLEANUP_SCRIPT"
+        echo "# LOKI/LOGGING BUCKETS (may be operational - coordinate with logging team):" >> "$CLEANUP_SCRIPT"
+        jq -c '.orphans.rgw.loki_related[]' "$JSON_REPORT" 2>/dev/null | while read -r row; do
+            bucket=$(echo "$row" | jq -r '.name')
+            objects=$(echo "$row" | jq -r '.objects')
+            echo "# $bucket ($objects objects) - Loki/logging related - VERIFY WITH LOGGING TEAM" >> "$CLEANUP_SCRIPT"
+        done
+    fi
     echo "" >> "$CLEANUP_SCRIPT"
 else
     if [[ -f "$AUDIT_DIR/rgw-buckets-list.txt" ]] && [[ -f "$AUDIT_DIR/obc-bucket-names.txt" ]]; then

@@ -97,65 +97,71 @@ collect_k8s_data() {
 }
 
 collect_ceph_cluster() {
-    log_line "Collecting Ceph cluster metadata"
+    log_line "Collecting Ceph metrics from Prometheus"
+    
+    # Still collect ceph status for health info (no Prometheus equivalent for all fields)
     rook_exec ceph status --format json > "$DATA_DIR/ceph-status.json"
-    rook_exec ceph df --format json > "$DATA_DIR/ceph-df.json"
-    rook_exec ceph df detail --format json > "$POOL_STATS_JSON"
-    rook_exec rados df --format json > "$DATA_DIR/rados-df.json"
+    
+    # Collect Prometheus metrics for capacity and pool stats
+    query_prometheus "sum(ceph_osd_stat_bytes)" > "$DATA_DIR/prom-cluster-total.json"
+    query_prometheus "sum(ceph_pool_bytes_used)" > "$DATA_DIR/prom-cluster-used.json"
+    query_prometheus "sum(ceph_pool_stored)" > "$DATA_DIR/prom-cluster-stored.json"
+    
+    # Pool-level metrics
+    query_prometheus "ceph_pool_bytes_used" > "$DATA_DIR/prom-pool-bytes-used.json"
+    query_prometheus "ceph_pool_stored" > "$DATA_DIR/prom-pool-stored.json"
+    query_prometheus "ceph_pool_metadata" > "$DATA_DIR/prom-pool-metadata.json"
 
     section "Ceph Cluster Status"
-    local health osds mons total_bytes used_bytes
+    local health osds mons total_bytes used_bytes stored_bytes
     health=$(jq -r '.health.status // "unknown"' "$DATA_DIR/ceph-status.json")
     osds=$(jq '.osdmap.num_osds // 0' "$DATA_DIR/ceph-status.json")
     mons=$(jq '.monmap.mons | length // 0' "$DATA_DIR/ceph-status.json")
-    total_bytes=$(jq '.stats.total_bytes // 0' "$DATA_DIR/ceph-df.json")
-    used_bytes=$(jq '.stats.total_used_bytes // 0' "$DATA_DIR/ceph-df.json")
+    
+    # Extract capacity from Prometheus metrics
+    total_bytes=$(extract_metric_value "$(cat "$DATA_DIR/prom-cluster-total.json")")
+    used_bytes=$(extract_metric_value "$(cat "$DATA_DIR/prom-cluster-used.json")")
+    stored_bytes=$(extract_metric_value "$(cat "$DATA_DIR/prom-cluster-stored.json")")
+    
+    # Calculate efficiency ratio
+    local efficiency_ratio="N/A"
+    if [[ "$used_bytes" != "0" ]] && [[ -n "$used_bytes" ]]; then
+        efficiency_ratio=$(echo "scale=2; $stored_bytes / $used_bytes" | bc -l)
+    fi
 
     append_line "Health: $health"
     append_line "MONs: $mons | OSDs: $osds"
-    append_line "Usage: $(human_bytes "$used_bytes") / $(human_bytes "$total_bytes")"
+    append_line "Raw Capacity: $(human_bytes "$total_bytes")"
+    append_line "Used (with replication): $(human_bytes "$used_bytes")"
+    append_line "Stored (client data): $(human_bytes "$stored_bytes")"
+    append_line "Storage Efficiency: ${efficiency_ratio}x"
 
     subsection "Top pools by usage"
-    local total_cluster_bytes
-    total_cluster_bytes=$(jq '.stats.total_bytes // 0' "$DATA_DIR/ceph-df.json")
-    jq -r --argjson total_bytes "$total_cluster_bytes" '
-        def normalize_bytes(val, field_name):
-            val as $v
-            | if ($v == 0 or $v == null) then 0
-              elif ($total_bytes > 0 and $v > $total_bytes) then
-                  # Value exceeds cluster total - likely in KB, convert to bytes
-                  ($v * 1024)
-              else
-                  # Assume bytes
-                  $v
-              end;
-        def pool_entries:
-            (.pools // []) | map({
-                pool_name:(.name // "unknown"),
-                bytes_used:(
-                    if (.stats.bytes_used? != null) then normalize_bytes(.stats.bytes_used | tonumber, "bytes_used")
-                    elif (.stats.kb_used? != null) then (.stats.kb_used | tonumber) * 1024
-                    elif (.stats.stored? != null) then normalize_bytes(.stats.stored | tonumber, "stored")
-                    else 0 end)
-            });
-        pool_entries[]
-        | [ .pool_name, (.bytes_used/1024/1024) ]
-        | @tsv
-    ' "$POOL_STATS_JSON" \
+    # Parse Prometheus pool metrics (always in bytes, no guessing needed!)
+    jq -r '.data.result[] | 
+        [.metric.name // .metric.pool_name // "unknown", (.value[1] | tonumber)] | 
+        @tsv' "$DATA_DIR/prom-pool-bytes-used.json" 2>/dev/null \
         | sort -k2 -n -r | head -10 \
-        | awk '{printf "  %-35s %12.2f MiB\n", $1, $2}' \
-        | tee -a "$REPORT_FILE"
+        | awk '{printf "  %-35s %12.2f MiB\n", $1, $2/1024/1024}' \
+        | tee -a "$REPORT_FILE" || {
+            append_line "  (No pool metrics available from Prometheus)"
+        }
 }
 
 collect_rbd_data() {
     section "RBD Pools & Images"
+    
+    # Get RBD pools from Prometheus metadata
     local pools
-    pools=$(jq -r '(.pools // [])[]? | .name | select(test("(rbd|block)", "i"))' "$POOL_STATS_JSON" | sort -u)
+    pools=$(jq -r '.data.result[]? | select(.metric.type == "replicated" or .metric.type == "erasure") | .metric.name // .metric.pool_name' \
+        "$DATA_DIR/prom-pool-metadata.json" 2>/dev/null | grep -iE 'rbd|block' | sort -u || echo "")
+    
+    # Fallback to ceph command if Prometheus doesn't have pool data
     if [[ -z "$pools" ]]; then
-        pools=$(rook_exec ceph osd pool ls --format json 2>/dev/null | jq -r '.[]' | grep -E 'rbd|block' || true)
+        pools=$(rook_exec ceph osd pool ls --format json 2>/dev/null | jq -r '.[]' | grep -iE 'rbd|block' || true)
     fi
     if [[ -z "$pools" ]]; then
-        pools=$(rook_exec ceph osd pool ls 2>/dev/null | tr -d '[]",' | tr ' ' '\n' | grep -E 'rbd|block' || true)
+        pools=$(rook_exec ceph osd pool ls 2>/dev/null | tr -d '[]",' | tr ' ' '\n' | grep -iE 'rbd|block' || true)
     fi
 
     if [[ -z "$pools" ]]; then
@@ -165,6 +171,7 @@ collect_rbd_data() {
 
     local total_images=0
     local orphan_images=0
+    local test_pattern_images=0
 
     for pool in $pools; do
         local list_json
@@ -176,7 +183,7 @@ collect_rbd_data() {
         fi
         subsection "Pool: $pool"
         for image in $images; do
-            local info_json status_json size_bytes size_human watcher_count watchers_json has_pv manual_flag
+            local info_json status_json size_bytes size_human watcher_count watchers_json has_pv manual_flag is_test_pattern
             info_json=$(rook_exec rbd info "$pool/$image" --format json 2>/dev/null || echo '{}')
             size_bytes=$(echo "$info_json" | jq '.size // 0')
             size_human=$(human_bytes "$size_bytes")
@@ -184,11 +191,33 @@ collect_rbd_data() {
             watcher_count=$(echo "$status_json" | jq '.watchers | length // 0')
             watchers_json=$(echo "$status_json" | jq -c '.watchers // []')
 
+            # Enhanced PV matching using parse_volume_handle
             has_pv=false
-            if [[ -s "$pv_volume_map" ]] && grep -Fq "$image" "$pv_volume_map"; then
-                has_pv=true
+            if [[ -s "$pv_volume_map" ]]; then
+                # Try exact image name match (backward compatible)
+                if grep -Fq "$image" "$pv_volume_map"; then
+                    has_pv=true
+                else
+                    # Try parsing volumeHandle for pool/image match
+                    while IFS= read -r handle; do
+                        local parsed
+                        parsed=$(parse_volume_handle "$handle")
+                        if [[ "$parsed" == "$pool/$image" ]] || [[ "$parsed" == *"$image"* ]]; then
+                            has_pv=true
+                            break
+                        fi
+                    done < "$pv_volume_map"
+                fi
             fi
 
+            # Check for test/benchmark pattern names
+            is_test_pattern=false
+            if [[ "$image" =~ (test|bench|benchmark|fio|temp|tmp|demo) ]]; then
+                is_test_pattern=true
+                ((test_pattern_images++))
+            fi
+
+            # Orphan detection
             manual_flag=false
             if [[ "$has_pv" == false && $watcher_count -eq 0 ]]; then
                 manual_flag=true
@@ -203,9 +232,14 @@ collect_rbd_data() {
                 --argjson watcher_count "$watcher_count" \
                 --argjson has_pv "$has_pv" \
                 --argjson manual "$manual_flag" \
-                '{pool:$pool,image:$image,size_bytes:$size_bytes,size_human:$size_human,watchers:$watchers,watcher_count:$watcher_count,has_pv:$has_pv,manual_flag:$manual}' >> "$rbd_ndjson"
+                --argjson test_pattern "$is_test_pattern" \
+                '{pool:$pool,image:$image,size_bytes:$size_bytes,size_human:$size_human,watchers:$watchers,watcher_count:$watcher_count,has_pv:$has_pv,manual_flag:$manual,test_pattern:$test_pattern}' >> "$rbd_ndjson"
 
-            printf "  %-60s %12s | watchers: %s | bound: %s\n" "$pool/$image" "$size_human" "$watcher_count" "$has_pv" | tee -a "$REPORT_FILE"
+            printf "  %-60s %12s | watchers: %s | bound: %s" "$pool/$image" "$size_human" "$watcher_count" "$has_pv"
+            if [[ "$is_test_pattern" == true ]]; then
+                printf " | TEST"
+            fi
+            printf "\n" | tee -a "$REPORT_FILE"
 
             ((total_images++))
             if [[ "$has_pv" == false ]]; then
@@ -216,10 +250,19 @@ collect_rbd_data() {
 
     append_line "Total RBD images: $total_images"
     append_line "Potential orphaned images: $orphan_images"
+    if [[ $test_pattern_images -gt 0 ]]; then
+        append_line "Test/benchmark pattern images: $test_pattern_images (review manually)"
+    fi
 }
 
 collect_cephfs_data() {
     section "CephFS"
+    
+    # Collect Prometheus metrics for CephFS
+    query_prometheus "ceph_mds_metadata" > "$DATA_DIR/prom-mds-metadata.json" 2>/dev/null || true
+    query_prometheus "ceph_mds_root_rbytes" > "$DATA_DIR/prom-mds-rbytes.json" 2>/dev/null || true
+    query_prometheus "ceph_mds_root_rfiles" > "$DATA_DIR/prom-mds-rfiles.json" 2>/dev/null || true
+    
     local fs_list
     fs_list=$(rook_exec ceph fs ls --format json 2>/dev/null || echo '[]')
     write_json_file "$DATA_DIR/cephfs-list.json" "$fs_list"
@@ -234,6 +277,19 @@ collect_cephfs_data() {
 
     for fs in $fs_names; do
         subsection "Filesystem: $fs"
+        
+        # Try to get metrics from Prometheus first
+        local total_bytes total_files
+        total_bytes=$(jq -r --arg fs "$fs" '.data.result[]? | select(.metric.fs_id == $fs or .metric.ceph_daemon | contains($fs)) | .value[1]' \
+            "$DATA_DIR/prom-mds-rbytes.json" 2>/dev/null | head -1 || echo "0")
+        total_files=$(jq -r --arg fs "$fs" '.data.result[]? | select(.metric.fs_id == $fs or .metric.ceph_daemon | contains($fs)) | .value[1]' \
+            "$DATA_DIR/prom-mds-rfiles.json" 2>/dev/null | head -1 || echo "0")
+        
+        if [[ "$total_bytes" != "0" ]] && [[ -n "$total_bytes" ]]; then
+            append_line "Total managed data: $(human_bytes "$total_bytes")"
+            append_line "Total files: $total_files"
+        fi
+        
         rook_exec ceph fs status "$fs" | tee -a "$REPORT_FILE" || true
 
         local groups_json
@@ -254,6 +310,25 @@ collect_cephfs_data() {
 
 collect_rgw_data() {
     section "RGW Buckets"
+    
+    # Build enhanced OBC bucket mapping - DUAL sources
+    log_line "Building OBC-to-bucket mapping (spec + secrets)"
+    
+    # Source 1: Direct from OBC spec.bucketName  
+    jq -r '.items[]? | .spec.bucketName // empty' "$DATA_DIR/obc.json" 2>/dev/null \
+        | sed '/^$/d' > "$DATA_DIR/obc-buckets-spec.txt"
+    
+    # Source 2: Extract from Secrets (for manually created or orphaned buckets)
+    oc get secrets --all-namespaces \
+        -l bucket-provisioner=openshift-storage.ceph.rook.io \
+        -o json 2>/dev/null | \
+        jq -r '.items[]? | .data.BUCKET_NAME // empty | @base64d' 2>/dev/null \
+        | sed '/^$/d' > "$DATA_DIR/obc-buckets-secrets.txt" || touch "$DATA_DIR/obc-buckets-secrets.txt"
+    
+    # Combine and deduplicate
+    cat "$DATA_DIR/obc-buckets-spec.txt" "$DATA_DIR/obc-buckets-secrets.txt" 2>/dev/null \
+        | sort -u > "$obc_bucket_map"
+    
     local bucket_list
     bucket_list=$(rook_exec radosgw-admin bucket list --format json 2>/dev/null || echo '[]')
     write_json_file "$DATA_DIR/rgw-buckets-list.json" "$bucket_list"
@@ -266,24 +341,39 @@ collect_rgw_data() {
         return
     fi
 
-    local total=0 orphan=0
+    local total=0 orphan=0 loki_count=0
 
     for bucket in $buckets; do
-        local stats_json size_kb size_bytes objects owner has_obc loki_flag
+        local stats_json size_kb size_bytes objects owner has_obc has_obc_spec has_obc_secret loki_flag logging_flag
         stats_json=$(rook_exec radosgw-admin bucket stats --bucket="$bucket" --format json 2>/dev/null || echo '{}')
         size_kb=$(echo "$stats_json" | jq '.usage["rgw.main"].size_kb_actual // 0')
         size_bytes=$((size_kb * 1024))
         objects=$(echo "$stats_json" | jq '.usage["rgw.main"].num_objects // 0')
         owner=$(echo "$stats_json" | jq -r '.owner // "unknown"')
 
+        # Check both OBC sources
+        has_obc_spec=false
+        has_obc_secret=false
         has_obc=false
-        if [[ -s "$obc_bucket_map" ]] && grep -Fxq "$bucket" "$obc_bucket_map"; then
+        
+        if [[ -s "$DATA_DIR/obc-buckets-spec.txt" ]] && grep -Fxq "$bucket" "$DATA_DIR/obc-buckets-spec.txt"; then
+            has_obc_spec=true
+            has_obc=true
+        fi
+        if [[ -s "$DATA_DIR/obc-buckets-secrets.txt" ]] && grep -Fxq "$bucket" "$DATA_DIR/obc-buckets-secrets.txt"; then
+            has_obc_secret=true
             has_obc=true
         fi
 
+        # Check for Loki/logging patterns
         loki_flag=false
-        if [[ "$bucket" =~ [Ll]oki ]]; then
+        logging_flag=false
+        if [[ "$bucket" =~ (loki|logging) ]]; then
             loki_flag=true
+            ((loki_count++))
+        fi
+        if [[ "$bucket" =~ (log|logs) ]]; then
+            logging_flag=true
         fi
 
         jq -n \
@@ -292,10 +382,17 @@ collect_rgw_data() {
             --argjson size_bytes "$size_bytes" \
             --argjson objects "$objects" \
             --argjson has_obc "$has_obc" \
+            --argjson has_obc_spec "$has_obc_spec" \
+            --argjson has_obc_secret "$has_obc_secret" \
             --argjson loki "$loki_flag" \
-            '{name:$bucket,owner:$owner,size_bytes:$size_bytes,objects:$objects,has_obc:$has_obc,tags:{loki:$loki}}' >> "$rgw_ndjson"
+            --argjson logging "$logging_flag" \
+            '{name:$bucket,owner:$owner,size_bytes:$size_bytes,objects:$objects,has_obc:$has_obc,has_obc_spec:$has_obc_spec,has_obc_secret:$has_obc_secret,tags:{loki:$loki,logging:$logging}}' >> "$rgw_ndjson"
 
-        printf "  %-50s %12s | objects: %-10s | OBC: %s\n" "$bucket" "$(human_bytes "$size_bytes")" "$objects" "$has_obc" | tee -a "$REPORT_FILE"
+        printf "  %-50s %12s | objects: %-10s | OBC: %s" "$bucket" "$(human_bytes "$size_bytes")" "$objects" "$has_obc"
+        if [[ "$loki_flag" == true ]]; then
+            printf " | LOKI"
+        fi
+        printf "\n" | tee -a "$REPORT_FILE"
 
         ((total++))
         if [[ "$has_obc" == false ]]; then
@@ -305,6 +402,9 @@ collect_rgw_data() {
 
     append_line "Total buckets: $total"
     append_line "Buckets without OBC: $orphan"
+    if [[ $loki_count -gt 0 ]]; then
+        append_line "Loki/logging buckets: $loki_count (may be operational)"
+    fi
 }
 
 write_json_artifacts() {
@@ -314,42 +414,89 @@ write_json_artifacts() {
 }
 
 build_orphans_json() {
-    local pools_json orphan_json
-    pools_json="$POOL_STATS_JSON"
-    orphan_json="$DATA_DIR/orphans.json"
+    local orphan_json="$DATA_DIR/orphans.json"
+    
+    # Use Prometheus pool data if available, fallback to ceph-df-detail
+    local pools_source="$DATA_DIR/prom-pool-bytes-used.json"
+    if [[ ! -f "$pools_source" ]]; then
+        pools_source="$POOL_STATS_JSON"
+    fi
 
     jq -n \
         --argfile rbd "$DATA_DIR/rbd-images.json" \
         --argfile rgw "$DATA_DIR/rgw-buckets.json" \
-        --argfile pools "$pools_json" \
-        'def normalize_bytes($val, $total_bytes):
-            if ($val == 0 or $val == null) then 0
-            elif ($total_bytes > 0 and $val > $total_bytes) then ($val * 1024)
-            else $val end;
-        def pool_entries($p):
-            ($p.pools // []) | map({
-                pool_name:(.name // "unknown"),
-                bytes_used:(
-                    if (.stats.bytes_used? != null) then normalize_bytes(.stats.bytes_used | tonumber, $p.stats.total_bytes // 0)
-                    elif (.stats.kb_used? != null) then (.stats.kb_used | tonumber) * 1024
-                    elif (.stats.stored? != null) then normalize_bytes(.stats.stored | tonumber, $p.stats.total_bytes // 0)
-                    else 0 end)
-            });
-        {
-            rbd: [ $rbd[] | select(.has_pv | not) ],
-            rgw: [ $rgw[] | select(.has_obc | not) ],
-            loki_buckets: [ $rgw[] | select(.tags.loki == true) ],
-            suspected_pools: [ pool_entries($pools)[] | select((.pool_name // "") | test("(test|bench|perf|fio|tmp|temp)", "i")) | {name:(.pool_name // "unknown"),size_mib:(.bytes_used/1024/1024)} ]
+        '{
+            rbd: {
+                no_pv: [ $rbd[] | select(.has_pv == false) ],
+                no_watchers: [ $rbd[] | select(.watcher_count == 0) ],
+                test_pattern: [ $rbd[] | select(.test_pattern == true) ],
+                high_confidence_orphans: [ $rbd[] | select(
+                    .has_pv == false and 
+                    .watcher_count == 0 and 
+                    .size_bytes > 0
+                ) ]
+            },
+            rgw: {
+                no_obc: [ $rgw[] | select(.has_obc == false) ],
+                no_obc_no_secret: [ $rgw[] | select(
+                    .has_obc_spec == false and 
+                    .has_obc_secret == false
+                ) ],
+                loki_related: [ $rgw[] | select(.tags.loki == true) ],
+                empty_no_obc: [ $rgw[] | select(
+                    .has_obc == false and 
+                    .size_bytes == 0
+                ) ],
+                high_confidence_orphans: [ $rgw[] | select(
+                    .has_obc == false and 
+                    .tags.loki == false and 
+                    .tags.logging == false
+                ) ]
+            },
+            summary: {
+                rbd_orphan_count: [ $rbd[] | select(.has_pv == false) ] | length,
+                rbd_high_confidence: [ $rbd[] | select(.has_pv == false and .watcher_count == 0) ] | length,
+                rgw_orphan_count: [ $rgw[] | select(.has_obc == false) ] | length,
+                rgw_high_confidence: [ $rgw[] | select(
+                    .has_obc == false and 
+                    .tags.loki == false
+                ) ] | length
+            }
         }' > "$orphan_json"
+    
+    log_line "Orphan detection complete - see $orphan_json"
 }
 
 build_report_json() {
+    # Read Prometheus metrics if available
+    local total_raw_bytes total_used_bytes total_stored_bytes efficiency_ratio
+    if [[ -f "$DATA_DIR/prom-cluster-total.json" ]]; then
+        total_raw_bytes=$(extract_metric_value "$(cat "$DATA_DIR/prom-cluster-total.json")" || echo "0")
+        total_used_bytes=$(extract_metric_value "$(cat "$DATA_DIR/prom-cluster-used.json")" || echo "0")
+        total_stored_bytes=$(extract_metric_value "$(cat "$DATA_DIR/prom-cluster-stored.json")" || echo "0")
+        
+        if [[ "$total_used_bytes" != "0" ]] && [[ -n "$total_used_bytes" ]]; then
+            efficiency_ratio=$(echo "scale=3; $total_stored_bytes / $total_used_bytes" | bc -l)
+        else
+            efficiency_ratio="0"
+        fi
+    else
+        # Fallback to ceph-df.json
+        total_raw_bytes=$(jq -r '.stats.total_bytes // 0' "$DATA_DIR/ceph-df.json")
+        total_used_bytes=$(jq -r '.stats.total_used_bytes // 0' "$DATA_DIR/ceph-df.json")
+        total_stored_bytes="0"
+        efficiency_ratio="0"
+    fi
+
     jq -n \
         --arg generated "$(timestamp)" \
         --arg output "$AUDIT_DIR" \
+        --arg prom_endpoint "${PROMETHEUS_ENDPOINT:-none}" \
+        --arg total_raw "$total_raw_bytes" \
+        --arg total_used "$total_used_bytes" \
+        --arg total_stored "$total_stored_bytes" \
+        --arg efficiency "$efficiency_ratio" \
         --argfile cluster "$DATA_DIR/ceph-status.json" \
-        --argfile cluster_df "$DATA_DIR/ceph-df.json" \
-        --argfile rados "$POOL_STATS_JSON" \
         --argfile rbd "$DATA_DIR/rbd-images.json" \
         --argfile rgw "$DATA_DIR/rgw-buckets.json" \
         --argfile cephfs "$DATA_DIR/cephfs-subvols.json" \
@@ -357,46 +504,43 @@ build_report_json() {
         --argfile pvc "$DATA_DIR/pvc.json" \
         --argfile obc "$DATA_DIR/obc.json" \
         --argfile orphans "$DATA_DIR/orphans.json" \
-        'def normalize_bytes($val, $total_bytes):
-            if ($val == 0 or $val == null) then 0
-            elif ($total_bytes > 0 and $val > $total_bytes) then ($val * 1024)
-            else $val end;
-        def pool_entries($p):
-            ($p.pools // []) | map({
-                pool_name:(.name // "unknown"),
-                kb_used:(
-                    if (.stats.kb_used? != null) then (.stats.kb_used | tonumber)
-                    elif (.stats.bytes_used? != null) then (normalize_bytes(.stats.bytes_used | tonumber, $p.stats.total_bytes // 0) / 1024)
-                    elif (.stats.stored? != null) then (normalize_bytes(.stats.stored | tonumber, $p.stats.total_bytes // 0) / 1024)
-                    else 0 end)
-            });
-        {
-            generated_at:$generated,
-            output_dir:$output,
-            cluster:{
-                health:($cluster.health.status // "unknown"),
-                osds:($cluster.osdmap.num_osds // 0),
-                mons:($cluster.monmap.mons | length // 0)
+        '{
+            generated_at: $generated,
+            output_dir: $output,
+            data_sources: {
+                prometheus: $prom_endpoint,
+                kubernetes: "oc CLI authenticated",
+                ceph_direct: "rook-ceph-tools pod (supplemental)"
             },
-            stats:{
-                pools:(pool_entries($rados) | length),
-                rbd_images:($rbd | length),
-                rbd_orphans:($orphans.rbd | length),
-                rgw_buckets:($rgw | length),
-                rgw_orphans:($orphans.rgw | length),
-                loki_buckets:($orphans.loki_buckets | length),
-                suspected_pools:($orphans.suspected_pools | length),
-                pv_total:($pv.items | length),
-                pvc_total:($pvc.items | length),
-                obc_total:($obc.items | length)
+            cluster: {
+                health: ($cluster.health.status // "unknown"),
+                osds: ($cluster.osdmap.num_osds // 0),
+                mons: ($cluster.monmap.mons | length // 0),
+                capacity: {
+                    raw_total_bytes: ($total_raw | tonumber),
+                    raw_used_bytes: ($total_used | tonumber),
+                    stored_bytes: ($total_stored | tonumber),
+                    efficiency_ratio: ($efficiency | tonumber)
+                }
             },
-            datasets:{
-                pools:pool_entries($rados),
-                rbd:$rbd,
-                rgw:$rgw,
-                cephfs:$cephfs
+            stats: {
+                rbd_images: ($rbd | length),
+                rbd_orphans: ($orphans.rbd.no_pv | length),
+                rbd_high_confidence_orphans: ($orphans.rbd.high_confidence_orphans | length),
+                rgw_buckets: ($rgw | length),
+                rgw_orphans: ($orphans.rgw.no_obc | length),
+                rgw_high_confidence_orphans: ($orphans.rgw.high_confidence_orphans | length),
+                loki_buckets: ($orphans.rgw.loki_related | length),
+                pv_total: ($pv.items | length),
+                pvc_total: ($pvc.items | length),
+                obc_total: ($obc.items | length)
             },
-            orphans:$orphans
+            datasets: {
+                rbd: $rbd,
+                rgw: $rgw,
+                cephfs: $cephfs
+            },
+            orphans: $orphans
         }' > "$JSON_FILE"
 }
 
@@ -424,10 +568,159 @@ write_summary() {
 }
 
 print_cleanup_hints() {
-    section "Potential cleanup candidates"
-    jq -r '.orphans.rbd[]? | "RBD orphan: \(.pool)/\(.image) size \(.size_human)"' "$JSON_FILE" | sed 's/^/  - /' | tee -a "$REPORT_FILE"
-    jq -r '.orphans.rgw[]? | "RGW bucket without OBC: \(.name) size " + (.size_bytes | tostring)' "$JSON_FILE" | sed 's/^/  - /' | tee -a "$REPORT_FILE"
-    jq -r '.orphans.suspected_pools[]? | "Suspect pool: \(.name) (size=\(.size_mib) MiB)"' "$JSON_FILE" | sed 's/^/  - /' | tee -a "$REPORT_FILE"
+    section "Orphan Detection Summary"
+    
+    # HIGH CONFIDENCE orphans
+    subsection "High Confidence Orphans (safe to review for cleanup)"
+    jq -r '.orphans.rbd.high_confidence_orphans[]? | "RBD: \(.pool)/\(.image) - \(.size_human) - no PV, no watchers"' "$JSON_FILE" \
+        | sed 's/^/  ✗ /' | tee -a "$REPORT_FILE" || append_line "  (none)"
+    
+    jq -r '.orphans.rgw.high_confidence_orphans[]? | "RGW: \(.name) - \(.size_bytes) bytes - no OBC, not loki/logging"' "$JSON_FILE" \
+        | sed 's/^/  ✗ /' | tee -a "$REPORT_FILE" || true
+    
+    # MEDIUM CONFIDENCE - needs manual review
+    subsection "Requires Manual Review"
+    jq -r '.orphans.rbd.no_pv[]? | select(.watcher_count > 0) | "RBD: \(.pool)/\(.image) - \(.size_human) - no PV but has \(.watcher_count) watcher(s)"' "$JSON_FILE" \
+        | sed 's/^/  ⚠ /' | tee -a "$REPORT_FILE" || true
+    
+    jq -r '.orphans.rgw.loki_related[]? | "RGW: \(.name) - \(.size_bytes) bytes - Loki/logging bucket (may be operational)"' "$JSON_FILE" \
+        | sed 's/^/  ⚠ /' | tee -a "$REPORT_FILE" || true
+    
+    jq -r '.orphans.rbd.test_pattern[]? | "RBD: \(.pool)/\(.image) - test/benchmark pattern name"' "$JSON_FILE" \
+        | sed 's/^/  ⚠ /' | tee -a "$REPORT_FILE" || true
+    
+    # Summary counts
+    subsection "Summary"
+    jq -r '"RBD orphans (no PV): \(.orphans.summary.rbd_orphan_count // 0)"' "$JSON_FILE" | tee -a "$REPORT_FILE"
+    jq -r '"RBD high confidence: \(.orphans.summary.rbd_high_confidence // 0)"' "$JSON_FILE" | tee -a "$REPORT_FILE"
+    jq -r '"RGW orphans (no OBC): \(.orphans.summary.rgw_orphan_count // 0)"' "$JSON_FILE" | tee -a "$REPORT_FILE"
+    jq -r '"RGW high confidence: \(.orphans.summary.rgw_high_confidence // 0)"' "$JSON_FILE" | tee -a "$REPORT_FILE"
+}
+
+generate_orphan_candidates_report() {
+    local report="$AUDIT_DIR/potential-orphans.txt"
+    
+    log_line "Generating orphan candidates report for manual review"
+    
+    cat > "$report" <<'HEADER'
+=================================================================================
+POTENTIAL ORPHANED RESOURCES - MANUAL REVIEW REQUIRED
+=================================================================================
+
+This report categorizes potential orphaned resources by confidence level.
+Review each section carefully before taking any cleanup actions.
+
+CONFIDENCE LEVELS:
+  HIGH       - Strong evidence of orphan status, low risk of disruption
+  MEDIUM     - Some evidence, requires verification before cleanup
+  LOW        - May be in use, proceed with extreme caution
+
+HEADER
+
+    # HIGH CONFIDENCE RBD IMAGES
+    echo "" >> "$report"
+    echo "=== HIGH CONFIDENCE: ORPHANED RBD IMAGES ===" >> "$report"
+    echo "" >> "$report"
+    echo "These RBD images have NO PersistentVolume, NO watchers, and contain data." >> "$report"
+    echo "They are safe candidates for cleanup after verification." >> "$report"
+    echo "" >> "$report"
+    
+    jq -r '.orphans.rbd.high_confidence_orphans[]? | 
+        "  \(.pool)/\(.image)\n    Size: \(.size_human)\n    Watchers: \(.watcher_count)\n    Has PV: \(.has_pv)\n"' \
+        "$JSON_FILE" >> "$report" 2>/dev/null || echo "  (none detected)" >> "$report"
+    
+    # HIGH CONFIDENCE RGW BUCKETS
+    echo "" >> "$report"
+    echo "=== HIGH CONFIDENCE: ORPHANED RGW BUCKETS ===" >> "$report"
+    echo "" >> "$report"
+    echo "These buckets have NO ObjectBucketClaim and are NOT Loki/logging related." >> "$report"
+    echo "" >> "$report"
+    
+    jq -r '.orphans.rgw.high_confidence_orphans[]? | 
+        "  \(.name)\n    Size: \(.size_bytes) bytes\n    Objects: \(.objects)\n    Owner: \(.owner)\n"' \
+        "$JSON_FILE" >> "$report" 2>/dev/null || echo "  (none detected)" >> "$report"
+    
+    # MEDIUM CONFIDENCE RBD
+    echo "" >> "$report"
+    echo "=== MEDIUM CONFIDENCE: RBD IMAGES (verify before cleanup) ===" >> "$report"
+    echo "" >> "$report"
+    echo "These images have NO PersistentVolume but HAVE active watchers." >> "$report"
+    echo "Verify watchers are not stale before considering cleanup." >> "$report"
+    echo "" >> "$report"
+    
+    jq -r '.orphans.rbd.no_pv[]? | select(.watcher_count > 0) | 
+        "  \(.pool)/\(.image)\n    Size: \(.size_human)\n    Watchers: \(.watcher_count)\n    Check: rbd status \(.pool)/\(.image)\n"' \
+        "$JSON_FILE" >> "$report" 2>/dev/null || echo "  (none detected)" >> "$report"
+    
+    # MEDIUM CONFIDENCE RGW
+    echo "" >> "$report"
+    echo "=== MEDIUM CONFIDENCE: RGW BUCKETS (Loki/Logging related) ===" >> "$report"
+    echo "" >> "$report"
+    echo "These buckets have NO OBC but appear to be Loki/logging buckets." >> "$report"
+    echo "They may be operational. Verify with logging team before cleanup." >> "$report"
+    echo "" >> "$report"
+    
+    jq -r '.orphans.rgw.loki_related[]? | 
+        "  \(.name)\n    Size: \(.size_bytes) bytes\n    Objects: \(.objects)\n    Has OBC: \(.has_obc)\n"' \
+        "$JSON_FILE" >> "$report" 2>/dev/null || echo "  (none detected)" >> "$report"
+    
+    # LOW CONFIDENCE - Test patterns
+    echo "" >> "$report"
+    echo "=== LOW CONFIDENCE: TEST/BENCHMARK PATTERN IMAGES ===" >> "$report"
+    echo "" >> "$report"
+    echo "These images have test/benchmark/fio patterns in their names." >> "$report"
+    echo "They may still be in active use. Verify with dev/ops teams." >> "$report"
+    echo "" >> "$report"
+    
+    jq -r '.orphans.rbd.test_pattern[]? | 
+        "  \(.pool)/\(.image)\n    Size: \(.size_human)\n    Watchers: \(.watcher_count)\n    Has PV: \(.has_pv)\n"' \
+        "$JSON_FILE" >> "$report" 2>/dev/null || echo "  (none detected)" >> "$report"
+    
+    # VERIFICATION STEPS
+    cat >> "$report" <<'FOOTER'
+
+=================================================================================
+VERIFICATION STEPS BEFORE CLEANUP
+=================================================================================
+
+Before deleting ANY resource, complete these verification steps:
+
+1. Check cluster events for the resource:
+   oc get events -A | grep <resource-name>
+
+2. Verify no active pods are using the resource:
+   oc get pods -A -o wide | grep <resource-name>
+
+3. For RBD images, check watchers:
+   oc rsh -n openshift-storage <rook-ceph-tools-pod> rbd status <pool>/<image>
+
+4. For buckets, search application configs:
+   oc get cm,secrets -A -o yaml | grep <bucket-name>
+
+5. Wait 7 days and re-run audit to confirm resource is still orphaned.
+
+6. Use odf-cleanup-generator.sh to generate safe cleanup scripts.
+
+=================================================================================
+IMPORTANT NOTES
+=================================================================================
+
+- This report is for MANUAL REVIEW only
+- Do NOT automate cleanup based on this report alone
+- Always verify in a staging environment first if possible
+- Keep backups of any data before deletion
+- Coordinate with application teams before cleanup
+
+Generated: $(timestamp)
+Report path: $report
+
+=================================================================================
+FOOTER
+
+    log_line "Orphan candidates report written to: $report"
+    section "Orphan Candidates Report"
+    append_line "Detailed review file: $report"
+    append_line "Review this file manually before executing any cleanup."
 }
 
 main() {
@@ -441,6 +734,7 @@ main() {
     write_json_artifacts
     build_orphans_json
     build_report_json
+    generate_orphan_candidates_report
     write_summary
     print_cleanup_hints
     append_line "\nAudit complete. Artifacts in: $AUDIT_DIR"

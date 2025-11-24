@@ -27,6 +27,7 @@ if [[ ! -d "$AUDIT_DIR" ]]; then
 fi
 
 POOLS_JSON="$DATA_DIR/ceph-df-detail.json"
+POOLS_PROM_JSON="$DATA_DIR/prom-pool-bytes-used.json"
 RBD_JSON="$DATA_DIR/rbd-images.json"
 RGW_JSON="$DATA_DIR/rgw-buckets.json"
 PVC_JSON="$DATA_DIR/pvc.json"
@@ -41,7 +42,16 @@ echo "" | tee -a "$REPORT_FILE"
 
 print_pools() {
     echo "=== 1. POOLS BY SIZE (Largest First) ===" | tee -a "$REPORT_FILE"
-    if [[ -f "$POOLS_JSON" ]]; then
+    
+    # Prefer Prometheus metrics (always accurate, no unit guessing)
+    if [[ -f "$POOLS_PROM_JSON" ]]; then
+        jq -r '.data.result[]? | 
+            [.metric.name // .metric.pool_name // "unknown", (.value[1] | tonumber)] | 
+            @tsv' "$POOLS_PROM_JSON" 2>/dev/null \
+            | sort -k2 -n -r | head -15 \
+            | awk '{printf "  %-35s %12.2f MiB (Prometheus)\n", $1, $2/1024/1024}' \
+            | tee -a "$REPORT_FILE"
+    elif [[ -f "$POOLS_JSON" ]]; then
         local total_cluster_bytes
         total_cluster_bytes=$(jq '.stats.total_bytes // 0' "$POOLS_JSON" 2>/dev/null || echo "0")
         jq -r --argjson total_bytes "$total_cluster_bytes" '
@@ -64,7 +74,7 @@ print_pools() {
             | @tsv
         ' "$POOLS_JSON" \
             | sort -k2 -n -r | head -15 \
-            | awk '{printf "  %-35s %12.2f MiB\n", $1, $2}' | tee -a "$REPORT_FILE"
+            | awk '{printf "  %-35s %12.2f MiB (ceph df)\n", $1, $2}' | tee -a "$REPORT_FILE"
     else
         ensure_rook_tools_pod
         rook_exec rados df | grep -v "^POOL_NAME" | grep -v "^---" | grep -v "^total_" \

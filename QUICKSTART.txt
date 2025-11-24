@@ -10,6 +10,10 @@
    # If not found, create it:
    oc run -i -t rook-ceph-tools --image=registry.redhat.io/odf4/rook-ceph-rhel9-operator \
      --restart=Never --command -- bash
+   
+   # Verify Prometheus access (for enhanced metrics):
+   oc whoami -t  # Should return a token
+   oc get route thanos-querier -n openshift-monitoring  # Should show a route
 
 2. Make scripts executable:
    chmod +x odf-*.sh
@@ -54,7 +58,11 @@ less $AUDIT_DIR/top-consumers-report.txt
 ──────────────────────────────────────
 ./odf-audit.sh
 AUDIT_DIR=$(ls -td /tmp/odf-audit-* | head -1)
-grep "ORPHANED" $AUDIT_DIR/report.txt
+# Review detailed orphan report with confidence levels:
+less $AUDIT_DIR/potential-orphans.txt
+# Or check JSON for automation:
+jq '.orphans.rbd.high_confidence_orphans' $AUDIT_DIR/report.json
+jq '.orphans.rgw.high_confidence_orphans' $AUDIT_DIR/report.json
 
 
 🔎 Scenario 4: Interactive Investigation
@@ -98,10 +106,15 @@ After running odf-audit.sh, you'll find in /tmp/odf-audit-*/:
 
 report.txt                  ← Main comprehensive report (READ THIS FIRST)
 SUMMARY.txt                 ← Executive summary
-report.json                 ← Machine-readable summary (cluster stats, datasets, orphan lists)
-data/                       ← Raw JSON captures (ceph status, rados df, rbd-images.json, rgw-buckets.json, pv/pvc/obc dumps, cephfs subvolumes, etc.)
+report.json                 ← Machine-readable summary (cluster stats, datasets, orphan lists with confidence levels, data sources)
+potential-orphans.txt       ← Detailed orphan candidates report categorized by confidence level (HIGH/MEDIUM/LOW) for manual review
+data/                       ← Raw JSON captures:
+                              • Prometheus metrics: prom-cluster-*.json, prom-pool-*.json, prom-mds-*.json
+                              • Ceph commands: ceph-status.json, ceph-df.json
+                              • Application data: rbd-images.json, rgw-buckets.json, pv.json, pvc.json, obc.json, cephfs-subvols.json
+                              • OBC mappings: obc-buckets-spec.txt, obc-buckets-secrets.txt
 top-consumers-report.txt    ← Space usage analysis (after running odf-top-consumers.sh)
-cleanup-commands.sh         ← Generated deletion commands (after running odf-cleanup-generator.sh)
+cleanup-commands.sh         ← Generated deletion commands for high-confidence orphans (after running odf-cleanup-generator.sh)
 
 
 🛠️  TROUBLESHOOTING
@@ -112,9 +125,17 @@ Solution:
   oc get pods -n openshift-storage | grep rook-ceph-tools
   # Create if missing - see prerequisite #1
 
+Problem: "Cannot discover Prometheus endpoint"
+Solution:
+  oc get route thanos-querier -n openshift-monitoring
+  oc whoami -t  # Should return a token
+  # Ensure you have access to openshift-monitoring namespace
+  # Scripts will fall back to ceph commands if Prometheus unavailable
+
 Problem: "permission denied"
 Solution:
   oc auth can-i create pods/exec -n openshift-storage
+  oc auth can-i get routes -n openshift-monitoring
   # Request cluster-admin or storage-admin role
 
 Problem: Scripts hang
@@ -123,11 +144,11 @@ Solution:
   oc rsh -n openshift-storage rook-ceph-tools-xxx ceph -s
   # If slow, may need to increase timeouts
 
-Problem: jq command not found
+Problem: jq/curl command not found
 Solution:
-  # Install jq:
-  yum install jq -y   # RHEL/CentOS
-  apt install jq -y   # Ubuntu
+  # Install required tools:
+  yum install jq bc curl -y   # RHEL/CentOS
+  apt install jq bc curl -y   # Ubuntu
 
 
 📊 INTERPRETING RESULTS
