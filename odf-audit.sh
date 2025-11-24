@@ -114,7 +114,15 @@ collect_ceph_cluster() {
     append_line "Usage: $(human_bytes "$used_bytes") / $(human_bytes "$total_bytes")"
 
     subsection "Top pools by usage"
-    jq -r '.pool_stats[]? | [.name, (.kb_used/1024)] | @tsv' "$DATA_DIR/rados-df.json" \
+    jq -r '
+        def pool_entries:
+            (.pool_stats // []) as $stats
+            | (if ($stats | length) > 0 then [] else (.pools // []) end) as $legacy
+            | ($stats + ($legacy | map({pool_name:(.pool_name // .name // "unknown"), kb_used:(.kb_used // .stats.kb_used // 0)})));
+        pool_entries[]
+        | [(.pool_name // .name // "unknown"), ((.kb_used // .stats.kb_used // 0)/1024)]
+        | @tsv
+    ' "$DATA_DIR/rados-df.json" \
         | sort -k2 -n -r | head -10 \
         | awk '{printf "  %-35s %12.2f MiB\n", $1, $2}' \
         | tee -a "$REPORT_FILE"
@@ -292,11 +300,15 @@ build_orphans_json() {
         --argfile rbd "$DATA_DIR/rbd-images.json" \
         --argfile rgw "$DATA_DIR/rgw-buckets.json" \
         --argfile pools "$pools_json" \
-        '{
+        'def pool_entries($p):
+            ($p.pool_stats // []) as $stats
+            | (if ($stats | length) > 0 then [] else ($p.pools // []) end) as $legacy
+            | ($stats + ($legacy | map({pool_name:(.pool_name // .name // "unknown"), kb_used:(.kb_used // .stats.kb_used // 0)})));
+        {
             rbd: [ $rbd[] | select(.has_pv | not) ],
             rgw: [ $rgw[] | select(.has_obc | not) ],
             loki_buckets: [ $rgw[] | select(.tags.loki == true) ],
-            suspected_pools: [ $pools.pools[]? | select(.name | test("(test|bench|perf|fio|tmp|temp)", "i")) | {name:.name,kb_used:.stats.kb_used} ]
+            suspected_pools: [ pool_entries($pools)[] | select((.pool_name // .name // "") | test("(test|bench|perf|fio|tmp|temp)", "i")) | {name:(.pool_name // .name // "unknown"),kb_used:(.kb_used // .stats.kb_used // 0)} ]
         }' > "$orphan_json"
 }
 
@@ -314,7 +326,11 @@ build_report_json() {
         --argfile pvc "$DATA_DIR/pvc.json" \
         --argfile obc "$DATA_DIR/obc.json" \
         --argfile orphans "$DATA_DIR/orphans.json" \
-        '{
+        'def pool_entries($p):
+            ($p.pool_stats // []) as $stats
+            | (if ($stats | length) > 0 then [] else ($p.pools // []) end) as $legacy
+            | ($stats + ($legacy | map({pool_name:(.pool_name // .name // "unknown"), kb_used:(.kb_used // .stats.kb_used // 0)})));
+        {
             generated_at:$generated,
             output_dir:$output,
             cluster:{
@@ -323,7 +339,7 @@ build_report_json() {
                 mons:($cluster.monmap.mons | length // 0)
             },
             stats:{
-                pools:($rados.pools | length // 0),
+                pools:(pool_entries($rados) | length),
                 rbd_images:($rbd | length),
                 rbd_orphans:($orphans.rbd | length),
                 rgw_buckets:($rgw | length),
@@ -335,7 +351,7 @@ build_report_json() {
                 obc_total:($obc.items | length)
             },
             datasets:{
-                pools:($rados.pools // []),
+                pools:pool_entries($rados),
                 rbd:$rbd,
                 rgw:$rgw,
                 cephfs:$cephfs

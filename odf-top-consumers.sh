@@ -42,7 +42,15 @@ echo "" | tee -a "$REPORT_FILE"
 print_pools() {
     echo "=== 1. POOLS BY SIZE (Largest First) ===" | tee -a "$REPORT_FILE"
     if [[ -f "$POOLS_JSON" ]]; then
-        jq -r '.pool_stats[]? | [.name, (.kb_used/1024)] | @tsv' "$POOLS_JSON" \
+        jq -r '
+            def pool_entries:
+                (.pool_stats // []) as $stats
+                | (if ($stats | length) > 0 then [] else (.pools // []) end) as $legacy
+                | ($stats + ($legacy | map({pool_name:(.pool_name // .name // "unknown"), kb_used:(.kb_used // .stats.kb_used // 0)})));
+            pool_entries[]
+            | [(.pool_name // .name // "unknown"), ((.kb_used // .stats.kb_used // 0)/1024)]
+            | @tsv
+        ' "$POOLS_JSON" \
             | sort -k2 -n -r | head -15 \
             | awk '{printf "  %-35s %12.2f MiB\n", $1, $2}' | tee -a "$REPORT_FILE"
     else
