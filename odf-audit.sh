@@ -118,19 +118,9 @@ collect_ceph_cluster() {
         def pool_entries:
             (.pool_stats // []) as $stats
             | (if ($stats | length) > 0 then [] else (.pools // []) end) as $legacy
-            | ($stats + ($legacy | map({
-                pool_name:(.pool_name // .name // "unknown"),
-                kb_used:(
-                    if ((.kb_used? // null) != null) then (.kb_used | tonumber)
-                    elif ((.num_kb? // null) != null) then (.num_kb | tonumber)
-                    elif ((.stored? // null) != null) then ((.stored | tonumber) / 1024)
-                    elif ((.num_bytes? // null) != null) then ((.num_bytes | tonumber) / 1024)
-                    elif (.stats? and (.stats.kb_used? // null) != null) then (.stats.kb_used | tonumber)
-                    else 0 end
-                )
-            })));
+            | ($stats + ($legacy | map({pool_name:(.pool_name // .name // "unknown"), kb_used:(.kb_used // .stats.kb_used // 0)})));
         pool_entries[]
-        | [(.pool_name // .name // "unknown"), ((.kb_used // 0) / 1024)]
+        | [(.pool_name // .name // "unknown"), ((.kb_used // .stats.kb_used // 0)/1024)]
         | @tsv
     ' "$DATA_DIR/rados-df.json" \
         | sort -k2 -n -r | head -10 \
@@ -141,21 +131,7 @@ collect_ceph_cluster() {
 collect_rbd_data() {
     section "RBD Pools & Images"
     local pools
-    pools=$(jq -r '
-        def pool_entries:
-            (.pool_stats // []) as $stats
-            | (if ($stats | length) > 0 then [] else (.pools // []) end) as $legacy
-            | ($stats + ($legacy | map({
-                pool_name:(.pool_name // .name // "unknown")
-            })));
-        pool_entries[]
-        | (.pool_name // .name // "")
-        | select(test("(rbd|block)", "i"))
-    ' "$DATA_DIR/rados-df.json" | sort -u)
-
-    if [[ -z "$pools" ]]; then
-        pools=$(rook_exec ceph osd pool ls --format json 2>/dev/null | jq -r '.[]' | grep -E 'rbd|block' || true)
-    fi
+    pools=$(rook_exec ceph osd pool ls --format json 2>/dev/null | jq -r '.[]' | grep -E 'rbd|block' || true)
     if [[ -z "$pools" ]]; then
         pools=$(rook_exec ceph osd pool ls 2>/dev/null | tr -d '[]",' | tr ' ' '\n' | grep -E 'rbd|block' || true)
     fi
@@ -327,22 +303,12 @@ build_orphans_json() {
         'def pool_entries($p):
             ($p.pool_stats // []) as $stats
             | (if ($stats | length) > 0 then [] else ($p.pools // []) end) as $legacy
-            | ($stats + ($legacy | map({
-                pool_name:(.pool_name // .name // "unknown"),
-                kb_used:(
-                    if ((.kb_used? // null) != null) then (.kb_used | tonumber)
-                    elif ((.num_kb? // null) != null) then (.num_kb | tonumber)
-                    elif ((.stored? // null) != null) then ((.stored | tonumber) / 1024)
-                    elif ((.num_bytes? // null) != null) then ((.num_bytes | tonumber) / 1024)
-                    elif (.stats? and (.stats.kb_used? // null) != null) then (.stats.kb_used | tonumber)
-                    else 0 end
-                )
-            })));
+            | ($stats + ($legacy | map({pool_name:(.pool_name // .name // "unknown"), kb_used:(.kb_used // .stats.kb_used // 0)})));
         {
             rbd: [ $rbd[] | select(.has_pv | not) ],
             rgw: [ $rgw[] | select(.has_obc | not) ],
             loki_buckets: [ $rgw[] | select(.tags.loki == true) ],
-            suspected_pools: [ pool_entries($pools)[] | select((.pool_name // .name // "") | test("(test|bench|perf|fio|tmp|temp)", "i")) | {name:(.pool_name // .name // "unknown"),kb_used:.kb_used} ]
+            suspected_pools: [ pool_entries($pools)[] | select((.pool_name // .name // "") | test("(test|bench|perf|fio|tmp|temp)", "i")) | {name:(.pool_name // .name // "unknown"),kb_used:(.kb_used // .stats.kb_used // 0)} ]
         }' > "$orphan_json"
 }
 
@@ -363,17 +329,7 @@ build_report_json() {
         'def pool_entries($p):
             ($p.pool_stats // []) as $stats
             | (if ($stats | length) > 0 then [] else ($p.pools // []) end) as $legacy
-            | ($stats + ($legacy | map({
-                pool_name:(.pool_name // .name // "unknown"),
-                kb_used:(
-                    if ((.kb_used? // null) != null) then (.kb_used | tonumber)
-                    elif ((.num_kb? // null) != null) then (.num_kb | tonumber)
-                    elif ((.stored? // null) != null) then ((.stored | tonumber) / 1024)
-                    elif ((.num_bytes? // null) != null) then ((.num_bytes | tonumber) / 1024)
-                    elif (.stats? and (.stats.kb_used? // null) != null) then (.stats.kb_used | tonumber)
-                    else 0 end
-                )
-            })));
+            | ($stats + ($legacy | map({pool_name:(.pool_name // .name // "unknown"), kb_used:(.kb_used // .stats.kb_used // 0)})));
         {
             generated_at:$generated,
             output_dir:$output,
