@@ -200,13 +200,19 @@ extract_metric_value() {
     local metric_name=${2:-}
     local label_filter=${3:-}
     
+    # Validate JSON input
+    if [[ -z "$json" ]] || ! echo "$json" | jq -e . >/dev/null 2>&1; then
+        echo "0"
+        return
+    fi
+    
     # Extract scalar value from instant query result
     if [[ -z "$label_filter" ]]; then
-        echo "$json" | jq -r '.data.result[0].value[1] // "0"'
+        echo "$json" | jq -r '.data.result[0].value[1] // "0"' 2>/dev/null || echo "0"
     else
         # Filter by label and extract value
         echo "$json" | jq -r --arg filter "$label_filter" \
-            '.data.result[] | select(.metric | contains($filter)) | .value[1] // "0"'
+            '.data.result[] | select(.metric | contains($filter)) | .value[1] // "0"' 2>/dev/null || echo "0"
     fi
 }
 
