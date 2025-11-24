@@ -21,6 +21,7 @@ REPORT_FILE="$AUDIT_DIR/report.txt"
 SUMMARY_FILE="$AUDIT_DIR/SUMMARY.txt"
 JSON_FILE="$AUDIT_DIR/report.json"
 RUN_LOG="$AUDIT_DIR/audit.log"
+POOL_STATS_JSON="$DATA_DIR/ceph-df-detail.json"
 
 : > "$REPORT_FILE"
 : > "$RUN_LOG"
@@ -99,6 +100,7 @@ collect_ceph_cluster() {
     log_line "Collecting Ceph cluster metadata"
     rook_exec ceph status --format json > "$DATA_DIR/ceph-status.json"
     rook_exec ceph df --format json > "$DATA_DIR/ceph-df.json"
+    rook_exec ceph df detail --format json > "$POOL_STATS_JSON"
     rook_exec rados df --format json > "$DATA_DIR/rados-df.json"
 
     section "Ceph Cluster Status"
@@ -115,26 +117,15 @@ collect_ceph_cluster() {
 
     subsection "Top pools by usage"
     jq -r '
-        def normalize_pool:
-            {
-                pool_name:(.pool_name // .name // "unknown"),
-                kb_used:(
-                    if (.kb_used? != null) then (.kb_used | tonumber)
-                    elif (.num_kb? != null) then (.num_kb | tonumber)
-                    elif (.stored? != null) then ((.stored | tonumber) / 1024)
-                    elif (.num_bytes? != null) then ((.num_bytes | tonumber) / 1024)
-                    elif (.stats? and (.stats.kb_used? != null)) then (.stats.kb_used | tonumber)
-                    else 0 end
-                )
-            };
-        def pool_entries:
-            (.pool_stats // []) as $stats
-            | (if ($stats | length) > 0 then [] else (.pools // []) end) as $legacy
-            | ( ($stats | map(normalize_pool)) + ($legacy | map(normalize_pool)) );
-        pool_entries[]
-        | [(.pool_name), (.kb_used/1024)]
+        (.pools // [])[]
+        | { name:(.name // "unknown"), kb:(
+            if (.stats.kb_used? != null) then (.stats.kb_used | tonumber)
+            elif (.stats.bytes_used? != null) then ((.stats.bytes_used | tonumber)/1024)
+            elif (.stats.stored? != null) then ((.stats.stored | tonumber)/1024)
+            else 0 end) }
+        | [ .name, (.kb/1024) ]
         | @tsv
-    ' "$DATA_DIR/rados-df.json" \
+    ' "$POOL_STATS_JSON" \
         | sort -k2 -n -r | head -10 \
         | awk '{printf "  %-35s %12.2f MiB\n", $1, $2}' \
         | tee -a "$REPORT_FILE"
@@ -143,7 +134,10 @@ collect_ceph_cluster() {
 collect_rbd_data() {
     section "RBD Pools & Images"
     local pools
-    pools=$(rook_exec ceph osd pool ls --format json 2>/dev/null | jq -r '.[]' | grep -E 'rbd|block' || true)
+    pools=$(jq -r '(.pools // [])[]? | .name | select(test("(rbd|block)", "i"))' "$POOL_STATS_JSON" | sort -u)
+    if [[ -z "$pools" ]]; then
+        pools=$(rook_exec ceph osd pool ls --format json 2>/dev/null | jq -r '.[]' | grep -E 'rbd|block' || true)
+    fi
     if [[ -z "$pools" ]]; then
         pools=$(rook_exec ceph osd pool ls 2>/dev/null | tr -d '[]",' | tr ' ' '\n' | grep -E 'rbd|block' || true)
     fi
@@ -305,29 +299,22 @@ write_json_artifacts() {
 
 build_orphans_json() {
     local pools_json orphan_json
-    pools_json="$DATA_DIR/rados-df.json"
+    pools_json="$POOL_STATS_JSON"
     orphan_json="$DATA_DIR/orphans.json"
 
     jq -n \
         --argfile rbd "$DATA_DIR/rbd-images.json" \
         --argfile rgw "$DATA_DIR/rgw-buckets.json" \
         --argfile pools "$pools_json" \
-        'def normalize_pool:
-            {
-                pool_name:(.pool_name // .name // "unknown"),
+        'def pool_entries($p):
+            ($p.pools // []) | map({
+                pool_name:(.name // "unknown"),
                 kb_used:(
-                    if (.kb_used? != null) then (.kb_used | tonumber)
-                    elif (.num_kb? != null) then (.num_kb | tonumber)
-                    elif (.stored? != null) then ((.stored | tonumber) / 1024)
-                    elif (.num_bytes? != null) then ((.num_bytes | tonumber) / 1024)
-                    elif (.stats? and (.stats.kb_used? != null)) then (.stats.kb_used | tonumber)
-                    else 0 end
-                )
-            };
-        def pool_entries($p):
-            ($p.pool_stats // []) as $stats
-            | (if ($stats | length) > 0 then [] else ($p.pools // []) end) as $legacy
-            | ( ($stats | map(normalize_pool)) + ($legacy | map(normalize_pool)) );
+                    if (.stats.kb_used? != null) then (.stats.kb_used | tonumber)
+                    elif (.stats.bytes_used? != null) then ((.stats.bytes_used | tonumber)/1024)
+                    elif (.stats.stored? != null) then ((.stats.stored | tonumber)/1024)
+                    else 0 end)
+            });
         {
             rbd: [ $rbd[] | select(.has_pv | not) ],
             rgw: [ $rgw[] | select(.has_obc | not) ],
@@ -342,7 +329,7 @@ build_report_json() {
         --arg output "$AUDIT_DIR" \
         --argfile cluster "$DATA_DIR/ceph-status.json" \
         --argfile cluster_df "$DATA_DIR/ceph-df.json" \
-        --argfile rados "$DATA_DIR/rados-df.json" \
+        --argfile rados "$POOL_STATS_JSON" \
         --argfile rbd "$DATA_DIR/rbd-images.json" \
         --argfile rgw "$DATA_DIR/rgw-buckets.json" \
         --argfile cephfs "$DATA_DIR/cephfs-subvols.json" \
@@ -350,22 +337,15 @@ build_report_json() {
         --argfile pvc "$DATA_DIR/pvc.json" \
         --argfile obc "$DATA_DIR/obc.json" \
         --argfile orphans "$DATA_DIR/orphans.json" \
-        'def normalize_pool:
-            {
-                pool_name:(.pool_name // .name // "unknown"),
+        'def pool_entries($p):
+            ($p.pools // []) | map({
+                pool_name:(.name // "unknown"),
                 kb_used:(
-                    if (.kb_used? != null) then (.kb_used | tonumber)
-                    elif (.num_kb? != null) then (.num_kb | tonumber)
-                    elif (.stored? != null) then ((.stored | tonumber) / 1024)
-                    elif (.num_bytes? != null) then ((.num_bytes | tonumber) / 1024)
-                    elif (.stats? and (.stats.kb_used? != null)) then (.stats.kb_used | tonumber)
-                    else 0 end
-                )
-            };
-        def pool_entries($p):
-            ($p.pool_stats // []) as $stats
-            | (if ($stats | length) > 0 then [] else ($p.pools // []) end) as $legacy
-            | ( ($stats | map(normalize_pool)) + ($legacy | map(normalize_pool)) );
+                    if (.stats.kb_used? != null) then (.stats.kb_used | tonumber)
+                    elif (.stats.bytes_used? != null) then ((.stats.bytes_used | tonumber)/1024)
+                    elif (.stats.stored? != null) then ((.stats.stored | tonumber)/1024)
+                    else 0 end)
+            });
         {
             generated_at:$generated,
             output_dir:$output,
