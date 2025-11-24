@@ -136,12 +136,39 @@ collect_ceph_cluster() {
 
     subsection "Top pools by usage"
     # Parse Prometheus pool metrics (always in bytes, no guessing!)
+    # Debug: check if file exists and is valid JSON
+    if [[ ! -f "$DATA_DIR/prom-pool-bytes-used.json" ]]; then
+        append_line "  ERROR: prom-pool-bytes-used.json not found"
+        return
+    fi
+    
+    if ! jq -e . "$DATA_DIR/prom-pool-bytes-used.json" >/dev/null 2>&1; then
+        append_line "  ERROR: prom-pool-bytes-used.json is not valid JSON"
+        append_line "  Content preview:"
+        head -5 "$DATA_DIR/prom-pool-bytes-used.json" | sed 's/^/    /' | tee -a "$REPORT_FILE"
+        return
+    fi
+    
+    # Check if we have results
+    local result_count
+    result_count=$(jq '.data.result | length' "$DATA_DIR/prom-pool-bytes-used.json" 2>/dev/null || echo "0")
+    if [[ "$result_count" == "0" ]]; then
+        append_line "  No pool data in Prometheus response"
+        append_line "  Response structure:"
+        jq '.' "$DATA_DIR/prom-pool-bytes-used.json" | head -10 | sed 's/^/    /' | tee -a "$REPORT_FILE"
+        return
+    fi
+    
     jq -r '.data.result[]? | 
         [.metric.name // .metric.pool_name // "unknown", (.value[1] | tonumber)] | 
-        @tsv' "$DATA_DIR/prom-pool-bytes-used.json" \
+        @tsv' "$DATA_DIR/prom-pool-bytes-used.json" 2>/dev/null \
         | sort -k2 -n -r | head -10 \
         | awk '{printf "  %-35s %12.2f MiB\n", $1, $2/1024/1024}' \
-        | tee -a "$REPORT_FILE"
+        | tee -a "$REPORT_FILE" || {
+            append_line "  ERROR: Failed to parse pool metrics"
+            append_line "  File content:"
+            cat "$DATA_DIR/prom-pool-bytes-used.json" | head -20 | sed 's/^/    /' | tee -a "$REPORT_FILE"
+        }
 }
 
 collect_rbd_data() {
