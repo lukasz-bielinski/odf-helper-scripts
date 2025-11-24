@@ -1,0 +1,56 @@
+# ODF/Ceph Storage Monitoring Crontab Examples
+# Add these to your crontab for automated monitoring
+#
+# Edit crontab: crontab -e
+# View crontab: crontab -l
+
+# ============================================================================
+# Daily Quick Health Check (every day at 8 AM)
+# ============================================================================
+0 8 * * * /path/to/odf-quick-check.sh > /var/log/odf-quickcheck-$(date +\%Y\%m\%d).log 2>&1
+
+# ============================================================================
+# Weekly Full Audit (every Monday at 2 AM)
+# ============================================================================
+0 2 * * 1 /path/to/odf-audit.sh && /path/to/odf-top-consumers.sh $(ls -td /tmp/odf-audit-* | head -1)
+
+# ============================================================================
+# Monthly Cleanup Review (first day of month at 3 AM)
+# ============================================================================
+0 3 1 * * /path/to/odf-audit.sh && AUDIT_DIR=$(ls -td /tmp/odf-audit-* | head -1) && /path/to/odf-cleanup-generator.sh $AUDIT_DIR && echo "Review cleanup commands at: $AUDIT_DIR/cleanup-commands.sh"
+
+# ============================================================================
+# Alert on High Usage (every 6 hours)
+# ============================================================================
+0 */6 * * * /path/to/odf-quick-check.sh | grep -E "WARNING|ERROR" && echo "ODF Storage Alert!" | mail -s "ODF Alert" admin@example.com
+
+# ============================================================================
+# Example: Send daily summary via email
+# ============================================================================
+# Requires mail/sendmail configured
+0 9 * * * /path/to/odf-quick-check.sh 2>&1 | mail -s "ODF Daily Health Check - $(hostname)" storage-team@example.com
+
+# ============================================================================
+# Example: Store reports in central location
+# ============================================================================
+30 7 * * * /path/to/odf-quick-check.sh > /mnt/reports/odf-check-$(date +\%Y\%m\%d).txt 2>&1
+
+# ============================================================================
+# Example: Integration with monitoring system (Prometheus/AlertManager)
+# ============================================================================
+# Check every hour and export metrics
+0 * * * * /path/to/odf-quick-check.sh | /usr/local/bin/parse-to-prometheus-metrics.sh
+
+# ============================================================================
+# Example: Slack notification on issues
+# ============================================================================
+0 */4 * * * OUTPUT=$(/path/to/odf-quick-check.sh 2>&1) && echo "$OUTPUT" | grep -q "WARNING\|ERROR" && curl -X POST -H 'Content-type: application/json' --data "{\"text\":\"ODF Alert:\n\`\`\`$OUTPUT\`\`\`\"}" YOUR_SLACK_WEBHOOK_URL
+
+# ============================================================================
+# Notes:
+# - Adjust paths to match your installation
+# - Ensure scripts have execute permissions (chmod +x)
+# - Test commands before adding to crontab
+# - Consider log rotation for output files
+# - Verify mail/notification system is configured
+# ============================================================================

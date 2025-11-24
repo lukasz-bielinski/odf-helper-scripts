@@ -1,0 +1,190 @@
+╔════════════════════════════════════════════════════════════════╗
+║           ODF/Ceph Storage Audit Tools - QUICK START          ║
+╚════════════════════════════════════════════════════════════════╝
+
+🚀 IMMEDIATE USE (First Time)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. Verify prerequisites:
+   oc get pod -n openshift-storage | grep rook-ceph-tools
+   # If not found, create it:
+   oc run -i -t rook-ceph-tools --image=registry.redhat.io/odf4/rook-ceph-rhel9-operator \
+     --restart=Never --command -- bash
+
+2. Make scripts executable:
+   chmod +x odf-*.sh
+
+3. Run quick health check (1 minute):
+   ./odf-quick-check.sh
+
+4. Run full audit (3-5 minutes):
+   ./odf-audit.sh
+   # Note the output directory: /tmp/odf-audit-YYYYMMDD-HHMMSS
+   # report.txt + report.json + data/* are created inside this directory
+
+5. Review main report:
+   less /tmp/odf-audit-*/report.txt
+
+6. Analyze top consumers:
+   ./odf-top-consumers.sh /tmp/odf-audit-*
+
+7. Generate cleanup commands:
+   ./odf-cleanup-generator.sh /tmp/odf-audit-*
+
+
+🎯 COMMON SCENARIOS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+📊 Scenario 1: Daily Health Check
+──────────────────────────────────
+./odf-quick-check.sh
+# Takes ~30 seconds
+# Shows: cluster health, capacity, top issues
+
+
+🔍 Scenario 2: Find What's Using Space
+──────────────────────────────────────
+./odf-audit.sh
+AUDIT_DIR=$(ls -td /tmp/odf-audit-* | head -1)
+./odf-top-consumers.sh $AUDIT_DIR
+less $AUDIT_DIR/top-consumers-report.txt
+
+
+🧹 Scenario 3: Find Orphaned Resources
+──────────────────────────────────────
+./odf-audit.sh
+AUDIT_DIR=$(ls -td /tmp/odf-audit-* | head -1)
+grep "ORPHANED" $AUDIT_DIR/report.txt
+
+
+🔎 Scenario 4: Interactive Investigation
+──────────────────────────────────────────
+./odf-inspector.sh
+# Menu-driven interface
+# Choose option to inspect specific resources
+
+
+📦 Scenario 5: Check for Old Loki Buckets
+──────────────────────────────────────────
+./odf-audit.sh
+AUDIT_DIR=$(ls -td /tmp/odf-audit-* | head -1)
+grep -A 10 "Loki-Related Storage Check" $AUDIT_DIR/report.txt
+
+
+⚠️  IMPORTANT SAFETY RULES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+❌ NEVER delete anything without:
+   1. Verifying it's truly orphaned
+   2. Checking if in use (watchers, pods)
+   3. Taking backup if data is important
+   4. Getting approval (production)
+
+✅ ALWAYS verify before deletion:
+   # For RBD images:
+   oc rsh -n openshift-storage rook-ceph-tools-xxx rbd status <pool>/<image>
+   
+   # For buckets:
+   oc rsh -n openshift-storage rook-ceph-tools-xxx radosgw-admin bucket stats --bucket=<name>
+   
+   # For PVs:
+   oc get pv <pv-name> -o yaml
+
+
+📁 OUTPUT FILES EXPLAINED
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+After running odf-audit.sh, you'll find in /tmp/odf-audit-*/:
+
+report.txt                  ← Main comprehensive report (READ THIS FIRST)
+SUMMARY.txt                 ← Executive summary
+report.json                 ← Machine-readable summary (cluster stats, datasets, orphan lists)
+data/                       ← Raw JSON captures (ceph status, rados df, rbd-images.json, rgw-buckets.json, pv/pvc/obc dumps, cephfs subvolumes, etc.)
+top-consumers-report.txt    ← Space usage analysis (after running odf-top-consumers.sh)
+cleanup-commands.sh         ← Generated deletion commands (after running odf-cleanup-generator.sh)
+
+
+🛠️  TROUBLESHOOTING
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Problem: "rook-ceph-tools pod not found"
+Solution: 
+  oc get pods -n openshift-storage | grep rook-ceph-tools
+  # Create if missing - see prerequisite #1
+
+Problem: "permission denied"
+Solution:
+  oc auth can-i create pods/exec -n openshift-storage
+  # Request cluster-admin or storage-admin role
+
+Problem: Scripts hang
+Solution:
+  # Check if rook-ceph-tools is responsive:
+  oc rsh -n openshift-storage rook-ceph-tools-xxx ceph -s
+  # If slow, may need to increase timeouts
+
+Problem: jq command not found
+Solution:
+  # Install jq:
+  yum install jq -y   # RHEL/CentOS
+  apt install jq -y   # Ubuntu
+
+
+📊 INTERPRETING RESULTS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Storage Usage Thresholds:
+  < 60%  : Healthy, normal operation
+  60-75% : Monitor, plan capacity
+  75-85% : Warning, plan expansion soon
+  > 85%  : Critical, take action immediately
+
+Orphaned Resources:
+  "ORPHANED?: pool/image" - RBD image without matching PV
+  "ORPHANED?: bucket-name" - Bucket without matching OBC
+  
+  Action: Verify manually before deletion!
+
+Health Status:
+  HEALTH_OK   : All good
+  HEALTH_WARN : Review warnings, may need action
+  HEALTH_ERR  : Immediate attention required
+
+
+🔗 NEXT STEPS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. Set up automated monitoring (see crontab-examples.txt)
+2. Establish retention policy for audit reports
+3. Define cleanup procedures with team
+4. Document custom resources for future reference
+5. Schedule regular capacity planning reviews
+
+
+📚 DOCUMENTATION
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Full documentation:  README-ODF-AUDIT.md
+Cron examples:       crontab-examples.txt
+Interactive tool:    ./odf-inspector.sh
+
+
+💡 PRO TIPS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+• Run quick-check daily, full audit weekly
+• Keep audit reports for trend analysis
+• Review orphaned resources quarterly
+• Set up alerts at 75% capacity
+• Document manual resources (pools, buckets)
+• Test cleanup in dev before production
+• Always verify resources are truly unused
+
+
+═══════════════════════════════════════════════════════════════════
+
+For detailed documentation, see: README-ODF-AUDIT.md
+For interactive investigation: ./odf-inspector.sh
+For questions: Check logs in audit output directory
+
+═══════════════════════════════════════════════════════════════════
