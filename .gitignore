@@ -1,0 +1,82 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+bin/*
+Dockerfile.cross
+
+# Test binary, built with `go test -c`
+*.test
+
+# Output of the go coverage tool, specifically when used with LiteIDE
+*.out
+
+# Go workspace file
+go.work
+
+# Kubernetes Generated files - skip generated files, except for vendored files
+!vendor/**/zz_generated.*
+
+# Editor and IDE paraphernalia
+.idea
+.vscode
+*.swp
+*.swo
+*~
+
+# Temporary files
+*.log
+*.tmp
+.DS_Store
+
+# Test results
+/tmp/e2e-test-results-*.log
+
+# Helm values (may contain sensitive data)
+prometheus-values.yaml
+
+# Kubeconfig files (sensitive)
+kubeconfig*
+*.kubeconfig
+
+# Internal documentation (not for public repo)
+.internal-docs/
+
+# Session states
+.session-states/
+
+# Temporary directory
+temp/
+
+# Secrets with tokens (sensitive data)
+temp/*secret*.yaml
+temp/*credentials*.yaml
+temp/*token*.yaml
+temp/gitops-credentials*.yaml
+temp/github-credentials*.yaml
+temp/bitbucket-credentials*.yaml
+
+# Cursor IDE and MCP configuration
+.cursor/
+.cursorrules
+.cursorrules-*
+**/.cursorrules
+**/.cursorrules-*
+AGENTS.md
+mcp.json
+**/mcp.json
+cursor-mcp-config.json
+**/cursor-mcp-config.json
+CURSOR_GUIDE.md
+AGENTS.md
+# IDE
+.idea/
+.vscode/
+
+# Logs
+*.log
+operator/bin/
+operator/main
+operator/git-askpass-helper
