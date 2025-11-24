@@ -159,29 +159,40 @@ collect_ceph_cluster() {
         return
     fi
     
-    # DEBUG: Show what labels are available
-    append_line "  [DEBUG] Available metric labels in first result:"
-    jq -r '.data.result[0].metric | keys | join(", ")' "$DATA_DIR/prom-pool-bytes-used.json" 2>/dev/null | sed 's/^/    /' | tee -a "$REPORT_FILE"
+    # Ceph Prometheus metrics use pool_id label (numeric ID, not name)
+    # We need to get pool metadata to map pool_id to pool name
+    local pool_metadata_available=false
+    if [[ -f "$DATA_DIR/prom-pool-metadata.json" ]] && jq -e '.data.result[0]' "$DATA_DIR/prom-pool-metadata.json" >/dev/null 2>&1; then
+        pool_metadata_available=true
+    fi
     
-    # Try multiple possible label names for pool name
-    # Ceph metrics can use: pool, pool_name, name, ceph_pool, etc.
-    local parsed_output
-    parsed_output=$(jq -r '.data.result[]? | 
-        . as $item |
-        [
-            ($item.metric.pool // $item.metric.pool_name // $item.metric.name // $item.metric.ceph_pool // "LABEL_NOT_FOUND"),
-            (if $item.value[1] then ($item.value[1] | tonumber) else 0 end)
-        ] | 
-        @tsv' "$DATA_DIR/prom-pool-bytes-used.json" 2>&1)
-    
-    if echo "$parsed_output" | grep -q "LABEL_NOT_FOUND"; then
-        append_line "  [DEBUG] Could not find pool name label. First metric:"
-        jq '.data.result[0]' "$DATA_DIR/prom-pool-bytes-used.json" | sed 's/^/    /' | tee -a "$REPORT_FILE"
-    else
-        echo "$parsed_output" \
+    if [[ "$pool_metadata_available" == true ]]; then
+        # Map pool_id to pool name using ceph_pool_metadata
+        jq -r --slurpfile metadata "$DATA_DIR/prom-pool-metadata.json" '
+            # Build pool_id -> name mapping from metadata
+            ($metadata[0].data.result | map({(.metric.pool_id): .metric.name}) | add) as $pool_map |
+            .data.result[]? |
+            [
+                ($pool_map[.metric.pool_id] // ("pool_id_" + .metric.pool_id)),
+                (.value[1] | tonumber)
+            ] | 
+            @tsv
+        ' "$DATA_DIR/prom-pool-bytes-used.json" \
             | sort -k2 -n -r | head -10 \
             | awk '{printf "  %-35s %12.2f MiB\n", $1, $2/1024/1024}' \
             | tee -a "$REPORT_FILE"
+    else
+        # Fallback: show pool_id if metadata unavailable
+        jq -r '.data.result[]? | 
+            [
+                ("pool_id_" + .metric.pool_id),
+                (.value[1] | tonumber)
+            ] | 
+            @tsv' "$DATA_DIR/prom-pool-bytes-used.json" \
+            | sort -k2 -n -r | head -10 \
+            | awk '{printf "  %-35s %12.2f MiB\n", $1, $2/1024/1024}' \
+            | tee -a "$REPORT_FILE"
+        append_line "  Note: Pool names unavailable, showing pool_id. Run 'oc get cephblockpools -A' to see names."
     fi
 }
 
