@@ -97,28 +97,18 @@ collect_k8s_data() {
 }
 
 collect_ceph_cluster() {
-    log_line "Collecting Ceph cluster metadata"
+    log_line "Collecting Ceph metrics from Prometheus"
     
-    # Collect ceph status for health info
+    # Collect ceph status for health info (no Prometheus equivalent for all fields)
     rook_exec ceph status --format json > "$DATA_DIR/ceph-status.json"
     
-    # Try Prometheus metrics first, fallback to ceph commands
-    local use_prometheus=false
-    if query_prometheus "sum(ceph_osd_stat_bytes)" > "$DATA_DIR/prom-cluster-total.json" 2>/dev/null; then
-        use_prometheus=true
-        log_line "Using Prometheus metrics for capacity data"
-        query_prometheus "sum(ceph_pool_bytes_used)" > "$DATA_DIR/prom-cluster-used.json" 2>/dev/null || true
-        query_prometheus "sum(ceph_pool_stored)" > "$DATA_DIR/prom-cluster-stored.json" 2>/dev/null || true
-        query_prometheus "ceph_pool_bytes_used" > "$DATA_DIR/prom-pool-bytes-used.json" 2>/dev/null || true
-        query_prometheus "ceph_pool_stored" > "$DATA_DIR/prom-pool-stored.json" 2>/dev/null || true
-        query_prometheus "ceph_pool_metadata" > "$DATA_DIR/prom-pool-metadata.json" 2>/dev/null || true
-    else
-        log_line "Prometheus unavailable, using ceph commands"
-        # Fallback to traditional ceph commands
-        rook_exec ceph df --format json > "$DATA_DIR/ceph-df.json"
-        rook_exec ceph df detail --format json > "$DATA_DIR/ceph-df-detail.json"
-        rook_exec rados df --format json > "$DATA_DIR/rados-df.json"
-    fi
+    # Collect Prometheus metrics - REQUIRED, no fallback
+    query_prometheus "sum(ceph_osd_stat_bytes)" > "$DATA_DIR/prom-cluster-total.json"
+    query_prometheus "sum(ceph_pool_bytes_used)" > "$DATA_DIR/prom-cluster-used.json"
+    query_prometheus "sum(ceph_pool_stored)" > "$DATA_DIR/prom-cluster-stored.json"
+    query_prometheus "ceph_pool_bytes_used" > "$DATA_DIR/prom-pool-bytes-used.json"
+    query_prometheus "ceph_pool_stored" > "$DATA_DIR/prom-pool-stored.json"
+    query_prometheus "ceph_pool_metadata" > "$DATA_DIR/prom-pool-metadata.json"
 
     section "Ceph Cluster Status"
     local health osds mons total_bytes used_bytes stored_bytes
@@ -126,84 +116,32 @@ collect_ceph_cluster() {
     osds=$(jq '.osdmap.num_osds // 0' "$DATA_DIR/ceph-status.json")
     mons=$(jq '.monmap.mons | length // 0' "$DATA_DIR/ceph-status.json")
     
-    # Extract capacity from Prometheus or fallback to ceph-df
-    if [[ "$use_prometheus" == true ]]; then
-        total_bytes=$(extract_metric_value "$(cat "$DATA_DIR/prom-cluster-total.json" 2>/dev/null || echo '{}')")
-        used_bytes=$(extract_metric_value "$(cat "$DATA_DIR/prom-cluster-used.json" 2>/dev/null || echo '{}')")
-        stored_bytes=$(extract_metric_value "$(cat "$DATA_DIR/prom-cluster-stored.json" 2>/dev/null || echo '{}')")
-    else
-        total_bytes=$(jq -r '.stats.total_bytes // 0' "$DATA_DIR/ceph-df.json" 2>/dev/null || echo "0")
-        used_bytes=$(jq -r '.stats.total_used_bytes // 0' "$DATA_DIR/ceph-df.json" 2>/dev/null || echo "0")
-        stored_bytes="0"
-    fi
+    # Extract capacity from Prometheus metrics
+    total_bytes=$(extract_metric_value "$(cat "$DATA_DIR/prom-cluster-total.json")")
+    used_bytes=$(extract_metric_value "$(cat "$DATA_DIR/prom-cluster-used.json")")
+    stored_bytes=$(extract_metric_value "$(cat "$DATA_DIR/prom-cluster-stored.json")")
     
     # Calculate efficiency ratio
     local efficiency_ratio="N/A"
     if [[ "$used_bytes" != "0" ]] && [[ "$stored_bytes" != "0" ]] && [[ -n "$used_bytes" ]]; then
-        efficiency_ratio=$(echo "scale=2; $stored_bytes / $used_bytes" | bc -l 2>/dev/null || echo "N/A")
+        efficiency_ratio=$(echo "scale=2; $stored_bytes / $used_bytes" | bc -l)
     fi
 
     append_line "Health: $health"
     append_line "MONs: $mons | OSDs: $osds"
     append_line "Raw Capacity: $(human_bytes "$total_bytes")"
     append_line "Used (with replication): $(human_bytes "$used_bytes")"
-    if [[ "$stored_bytes" != "0" ]]; then
-        append_line "Stored (client data): $(human_bytes "$stored_bytes")"
-        append_line "Storage Efficiency: ${efficiency_ratio}x"
-    fi
+    append_line "Stored (client data): $(human_bytes "$stored_bytes")"
+    append_line "Storage Efficiency: ${efficiency_ratio}x"
 
     subsection "Top pools by usage"
-    if [[ "$use_prometheus" == true ]] && [[ -f "$DATA_DIR/prom-pool-bytes-used.json" ]]; then
-        # Parse Prometheus pool metrics (always in bytes!)
-        jq -r '.data.result[]? | 
-            [.metric.name // .metric.pool_name // "unknown", (.value[1] | tonumber)] | 
-            @tsv' "$DATA_DIR/prom-pool-bytes-used.json" 2>/dev/null \
-            | sort -k2 -n -r | head -10 \
-            | awk '{printf "  %-35s %12.2f MiB\n", $1, $2/1024/1024}' \
-            | tee -a "$REPORT_FILE" || append_line "  (No Prometheus pool data)"
-    elif [[ -f "$DATA_DIR/ceph-df-detail.json" ]]; then
-        # Fallback to ceph-df-detail - handle multiple Ceph versions
-        local total_cluster_bytes
-        total_cluster_bytes=$(jq '.stats.total_bytes // 0' "$DATA_DIR/ceph-df.json" 2>/dev/null || echo "0")
-        
-        jq -r --argjson total_bytes "$total_cluster_bytes" '
-            # Normalize bytes value based on cluster size to detect KB vs bytes
-            def normalize_bytes(val):
-                val as $v |
-                if ($v == 0 or $v == null) then 0
-                elif ($total_bytes > 0 and $v > $total_bytes * 2) then
-                    # Value exceeds 2x cluster total - likely in KB, convert to bytes
-                    ($v * 1024)
-                else
-                    # Assume bytes
-                    $v
-                end;
-            
-            .pools[]? | 
-            {
-                name: (.name // "unknown"),
-                bytes: (
-                    if (.stats.bytes_used? != null) then 
-                        normalize_bytes(.stats.bytes_used | tonumber)
-                    elif (.stats.num_bytes? != null) then 
-                        normalize_bytes(.stats.num_bytes | tonumber)
-                    elif (.stats.kb_used? != null) then 
-                        (.stats.kb_used | tonumber) * 1024
-                    elif (.stats.stored? != null) then 
-                        normalize_bytes(.stats.stored | tonumber)
-                    else 
-                        0 
-                    end
-                )
-            } |
-            [.name, .bytes] | @tsv
-        ' "$DATA_DIR/ceph-df-detail.json" 2>/dev/null \
-            | sort -k2 -n -r | head -10 \
-            | awk '{printf "  %-35s %12.2f MiB\n", $1, $2/1024/1024}' \
-            | tee -a "$REPORT_FILE" || append_line "  (No pool data available)"
-    else
-        append_line "  (No pool metrics available)"
-    fi
+    # Parse Prometheus pool metrics (always in bytes, no guessing!)
+    jq -r '.data.result[]? | 
+        [.metric.name // .metric.pool_name // "unknown", (.value[1] | tonumber)] | 
+        @tsv' "$DATA_DIR/prom-pool-bytes-used.json" \
+        | sort -k2 -n -r | head -10 \
+        | awk '{printf "  %-35s %12.2f MiB\n", $1, $2/1024/1024}' \
+        | tee -a "$REPORT_FILE"
 }
 
 collect_rbd_data() {

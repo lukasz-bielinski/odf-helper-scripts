@@ -104,10 +104,23 @@ discover_prometheus_endpoint() {
     if [[ -n "$thanos_host" ]]; then
         PROMETHEUS_ENDPOINT="https://$thanos_host"
         PROMETHEUS_TOKEN=$(oc whoami -t 2>/dev/null || echo "")
-        if [[ -n "$PROMETHEUS_TOKEN" ]]; then
-            log_info "Using Thanos Querier: $PROMETHEUS_ENDPOINT"
-            return 0
+        if [[ -z "$PROMETHEUS_TOKEN" ]]; then
+            echo "" >&2
+            echo "========================================================================" >&2
+            echo "FATAL ERROR: Prometheus endpoint found but no authentication token!" >&2
+            echo "========================================================================" >&2
+            echo "" >&2
+            echo "Thanos Querier route found: $PROMETHEUS_ENDPOINT" >&2
+            echo "But 'oc whoami -t' returned empty token!" >&2
+            echo "" >&2
+            echo "Verify manually:" >&2
+            echo "  oc whoami -t" >&2
+            echo "  oc auth can-i get routes -n openshift-monitoring" >&2
+            echo "" >&2
+            exit 1
         fi
+        log_info "✓ Using Thanos Querier: $PROMETHEUS_ENDPOINT"
+        return 0
     fi
 
     # Method 2: Try Prometheus service in openshift-storage
@@ -121,24 +134,31 @@ discover_prometheus_endpoint() {
             -o jsonpath='{.spec.ports[0].port}' 2>/dev/null || echo "9090")
         PROMETHEUS_ENDPOINT="http://$prom_svc:$prom_port"
         PROMETHEUS_TOKEN=$(oc whoami -t 2>/dev/null || echo "")
-        log_info "Using Prometheus service: $PROMETHEUS_ENDPOINT"
+        log_info "✓ Using Prometheus service: $PROMETHEUS_ENDPOINT"
         return 0
     fi
 
-    # Method 3: Port-forward fallback (only if ODF_PROMETHEUS_PORT_FORWARD is set)
-    if [[ -n "${ODF_PROMETHEUS_PORT_FORWARD:-}" ]]; then
-        log_info "Port-forward mode requested but not implemented - use route or service"
-    fi
-
-    # No endpoint found - FAIL
-    echo "ERROR: Cannot discover Prometheus endpoint. Tried:" >&2
-    echo "  1. Thanos Querier route (openshift-monitoring)" >&2
-    echo "  2. Prometheus service (openshift-storage)" >&2
+    # No endpoint found - PANIC
     echo "" >&2
-    echo "Please ensure:" >&2
-    echo "  - OpenShift monitoring is enabled" >&2
-    echo "  - You have access to openshift-monitoring namespace" >&2
-    echo "  - 'oc whoami -t' returns a valid token" >&2
+    echo "========================================================================" >&2
+    echo "FATAL ERROR: Cannot discover Prometheus endpoint!" >&2
+    echo "========================================================================" >&2
+    echo "" >&2
+    echo "Tried methods:" >&2
+    echo "  1. Thanos Querier route in openshift-monitoring → NOT FOUND" >&2
+    echo "  2. Prometheus service in openshift-storage → NOT FOUND" >&2
+    echo "" >&2
+    echo "Verify manually:" >&2
+    echo "  # Check Thanos Querier:" >&2
+    echo "  oc get route thanos-querier -n openshift-monitoring" >&2
+    echo "" >&2
+    echo "  # Check Prometheus service:" >&2
+    echo "  oc get service prometheus-operated -n openshift-storage" >&2
+    echo "" >&2
+    echo "  # Check your permissions:" >&2
+    echo "  oc auth can-i get routes -n openshift-monitoring" >&2
+    echo "  oc auth can-i get services -n openshift-storage" >&2
+    echo "" >&2
     exit 1
 }
 
@@ -164,34 +184,76 @@ query_prometheus() {
     local max_retries=3
     local retry=0
     local response
+    local curl_exit_code
+
+    log_info "Querying Prometheus: $query"
 
     while [[ $retry -lt $max_retries ]]; do
         if [[ -n "$PROMETHEUS_TOKEN" ]]; then
             response=$(curl -sk -H "Authorization: Bearer $PROMETHEUS_TOKEN" \
-                "$full_url" 2>/dev/null || echo "")
+                "$full_url" 2>&1)
+            curl_exit_code=$?
         else
-            response=$(curl -sk "$full_url" 2>/dev/null || echo "")
+            response=$(curl -sk "$full_url" 2>&1)
+            curl_exit_code=$?
+        fi
+
+        # Check curl exit code
+        if [[ $curl_exit_code -ne 0 ]]; then
+            log_info "  Attempt $((retry+1))/$max_retries: curl failed (exit code: $curl_exit_code)"
+            ((retry++))
+            if [[ $retry -lt $max_retries ]]; then
+                sleep 2
+            fi
+            continue
         fi
 
         # Check if response is valid JSON and has data
         if echo "$response" | jq -e '.status == "success"' >/dev/null 2>&1; then
+            log_info "  ✓ Query successful"
             echo "$response"
             return 0
         fi
 
+        log_info "  Attempt $((retry+1))/$max_retries: Invalid response"
         ((retry++))
         if [[ $retry -lt $max_retries ]]; then
             sleep 2
         fi
     done
 
-    # Query failed after retries
-    echo "ERROR: Prometheus query failed after $max_retries attempts" >&2
+    # Query failed after retries - PANIC
+    echo "" >&2
+    echo "========================================================================" >&2
+    echo "FATAL ERROR: Prometheus query failed after $max_retries attempts!" >&2
+    echo "========================================================================" >&2
+    echo "" >&2
     echo "Query: $query" >&2
     echo "Endpoint: $PROMETHEUS_ENDPOINT" >&2
-    if [[ -n "$response" ]]; then
-        echo "Response: $response" >&2
+    echo "" >&2
+    echo "Full URL (for manual testing):" >&2
+    echo "  $full_url" >&2
+    echo "" >&2
+    if [[ -n "$PROMETHEUS_TOKEN" ]]; then
+        echo "Auth token: ${PROMETHEUS_TOKEN:0:20}..." >&2
+        echo "" >&2
+        echo "Manual test command:" >&2
+        echo "  curl -sk -H 'Authorization: Bearer \$(oc whoami -t)' \\" >&2
+        echo "    '$full_url'" >&2
+    else
+        echo "No auth token available!" >&2
+        echo "" >&2
+        echo "Manual test command:" >&2
+        echo "  curl -sk '$full_url'" >&2
     fi
+    echo "" >&2
+    if [[ -n "$response" ]]; then
+        echo "Last response:" >&2
+        echo "$response" | head -20 >&2
+        echo "" >&2
+    fi
+    echo "curl exit code: $curl_exit_code" >&2
+    echo "" >&2
     exit 1
 }
 
