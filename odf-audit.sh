@@ -153,8 +153,9 @@ collect_ceph_cluster() {
     
     if ! jq -e . "$DATA_DIR/prom-pool-bytes-used.json" >/dev/null 2>&1; then
         append_line "  ERROR: prom-pool-bytes-used.json is not valid JSON"
-        append_line "  Content preview:"
-        head -5 "$DATA_DIR/prom-pool-bytes-used.json" | sed 's/^/    /' | tee -a "$REPORT_FILE"
+        append_line "  File size: $(wc -c < "$DATA_DIR/prom-pool-bytes-used.json") bytes"
+        append_line "  First 500 chars:"
+        head -c 500 "$DATA_DIR/prom-pool-bytes-used.json" | sed 's/^/    /' | tee -a "$REPORT_FILE"
         return
     fi
     
@@ -177,16 +178,22 @@ collect_ceph_cluster() {
     
     if [[ "$pool_metadata_available" == true ]]; then
         # Map pool_id to pool name using ceph_pool_metadata
+        # Note: ceph_pool_metadata has .metric.name, ceph_pool_bytes_used has .metric.pool_id
         jq -r --slurpfile metadata "$DATA_DIR/prom-pool-metadata.json" '
             # Build pool_id -> name mapping from metadata
-            ($metadata[0].data.result | map({(.metric.pool_id): .metric.name}) | add) as $pool_map |
+            (
+                $metadata[0].data.result | 
+                map(select(.metric.pool_id != null and .metric.name != null)) |
+                map({key: .metric.pool_id, value: .metric.name}) | 
+                from_entries
+            ) as $pool_map |
             .data.result[]? |
             [
                 ($pool_map[.metric.pool_id] // ("pool_id_" + .metric.pool_id)),
                 (.value[1] | tonumber)
             ] | 
             @tsv
-        ' "$DATA_DIR/prom-pool-bytes-used.json" \
+        ' "$DATA_DIR/prom-pool-bytes-used.json" 2>&1 \
             | sort -k2 -n -r | head -10 \
             | awk '{printf "  %-35s %12.2f MiB\n", $1, $2/1024/1024}' \
             | tee -a "$REPORT_FILE"
