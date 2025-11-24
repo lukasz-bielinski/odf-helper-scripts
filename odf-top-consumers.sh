@@ -42,7 +42,7 @@ echo "" | tee -a "$REPORT_FILE"
 print_pools() {
     echo "=== 1. POOLS BY SIZE (Largest First) ===" | tee -a "$REPORT_FILE"
     if [[ -f "$POOLS_JSON" ]]; then
-        jq -r '.pools[]? | [.name, (.stats.kb_used/1024)] | @tsv' "$POOLS_JSON" \
+        jq -r '.pool_stats[]? | [.name, (.kb_used/1024)] | @tsv' "$POOLS_JSON" \
             | sort -k2 -n -r | head -15 \
             | awk '{printf "  %-35s %12.2f MiB\n", $1, $2}' | tee -a "$REPORT_FILE"
     else

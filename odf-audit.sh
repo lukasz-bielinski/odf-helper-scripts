@@ -114,14 +114,19 @@ collect_ceph_cluster() {
     append_line "Usage: $(human_bytes "$used_bytes") / $(human_bytes "$total_bytes")"
 
     subsection "Top pools by usage"
-    jq -r '.pools[] | {name:.name, used:.stats.kb_used} | select(.used>0) | [(.name), (.used/1024 | tostring + " MiB")] | @tsv' "$DATA_DIR/rados-df.json" \
-        | sort -k2 -n -r | head -10 | column -t | tee -a "$REPORT_FILE"
+    jq -r '.pool_stats[]? | [.name, (.kb_used/1024)] | @tsv' "$DATA_DIR/rados-df.json" \
+        | sort -k2 -n -r | head -10 \
+        | awk '{printf "  %-35s %12.2f MiB\n", $1, $2}' \
+        | tee -a "$REPORT_FILE"
 }
 
 collect_rbd_data() {
     section "RBD Pools & Images"
     local pools
-    pools=$(jq -r '.pools[]?.name' "$DATA_DIR/rados-df.json" | grep -E 'rbd|block' || true)
+    pools=$(rook_exec ceph osd pool ls --format json 2>/dev/null | jq -r '.[]' | grep -E 'rbd|block' || true)
+    if [[ -z "$pools" ]]; then
+        pools=$(rook_exec ceph osd pool ls 2>/dev/null | tr -d '[]",' | tr ' ' '\n' | grep -E 'rbd|block' || true)
+    fi
 
     if [[ -z "$pools" ]]; then
         append_line "No RBD pools detected"
