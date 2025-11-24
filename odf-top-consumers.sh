@@ -46,9 +46,19 @@ print_pools() {
             def pool_entries:
                 (.pool_stats // []) as $stats
                 | (if ($stats | length) > 0 then [] else (.pools // []) end) as $legacy
-                | ($stats + ($legacy | map({pool_name:(.pool_name // .name // "unknown"), kb_used:(.kb_used // .stats.kb_used // 0)})));
+                | ($stats + ($legacy | map({
+                    pool_name:(.pool_name // .name // "unknown"),
+                    kb_used:(
+                        if ((.kb_used? // null) != null) then (.kb_used | tonumber)
+                        elif ((.num_kb? // null) != null) then (.num_kb | tonumber)
+                        elif ((.stored? // null) != null) then ((.stored | tonumber) / 1024)
+                        elif ((.num_bytes? // null) != null) then ((.num_bytes | tonumber) / 1024)
+                        elif (.stats? and (.stats.kb_used? // null) != null) then (.stats.kb_used | tonumber)
+                        else 0 end
+                    )
+                })));
             pool_entries[]
-            | [(.pool_name // .name // "unknown"), ((.kb_used // .stats.kb_used // 0)/1024)]
+            | [(.pool_name // .name // "unknown"), (.kb_used / 1024)]
             | @tsv
         ' "$POOLS_JSON" \
             | sort -k2 -n -r | head -15 \
