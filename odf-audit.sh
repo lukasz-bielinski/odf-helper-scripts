@@ -115,12 +115,24 @@ collect_ceph_cluster() {
 
     subsection "Top pools by usage"
     jq -r '
+        def normalize_pool:
+            {
+                pool_name:(.pool_name // .name // "unknown"),
+                kb_used:(
+                    if (.kb_used? != null) then (.kb_used | tonumber)
+                    elif (.num_kb? != null) then (.num_kb | tonumber)
+                    elif (.stored? != null) then ((.stored | tonumber) / 1024)
+                    elif (.num_bytes? != null) then ((.num_bytes | tonumber) / 1024)
+                    elif (.stats? and (.stats.kb_used? != null)) then (.stats.kb_used | tonumber)
+                    else 0 end
+                )
+            };
         def pool_entries:
             (.pool_stats // []) as $stats
             | (if ($stats | length) > 0 then [] else (.pools // []) end) as $legacy
-            | ($stats + ($legacy | map({pool_name:(.pool_name // .name // "unknown"), kb_used:(.kb_used // .stats.kb_used // 0)})));
+            | ( ($stats | map(normalize_pool)) + ($legacy | map(normalize_pool)) );
         pool_entries[]
-        | [(.pool_name // .name // "unknown"), ((.kb_used // .stats.kb_used // 0)/1024)]
+        | [(.pool_name), (.kb_used/1024)]
         | @tsv
     ' "$DATA_DIR/rados-df.json" \
         | sort -k2 -n -r | head -10 \
@@ -300,10 +312,22 @@ build_orphans_json() {
         --argfile rbd "$DATA_DIR/rbd-images.json" \
         --argfile rgw "$DATA_DIR/rgw-buckets.json" \
         --argfile pools "$pools_json" \
-        'def pool_entries($p):
+        'def normalize_pool:
+            {
+                pool_name:(.pool_name // .name // "unknown"),
+                kb_used:(
+                    if (.kb_used? != null) then (.kb_used | tonumber)
+                    elif (.num_kb? != null) then (.num_kb | tonumber)
+                    elif (.stored? != null) then ((.stored | tonumber) / 1024)
+                    elif (.num_bytes? != null) then ((.num_bytes | tonumber) / 1024)
+                    elif (.stats? and (.stats.kb_used? != null)) then (.stats.kb_used | tonumber)
+                    else 0 end
+                )
+            };
+        def pool_entries($p):
             ($p.pool_stats // []) as $stats
             | (if ($stats | length) > 0 then [] else ($p.pools // []) end) as $legacy
-            | ($stats + ($legacy | map({pool_name:(.pool_name // .name // "unknown"), kb_used:(.kb_used // .stats.kb_used // 0)})));
+            | ( ($stats | map(normalize_pool)) + ($legacy | map(normalize_pool)) );
         {
             rbd: [ $rbd[] | select(.has_pv | not) ],
             rgw: [ $rgw[] | select(.has_obc | not) ],
@@ -326,10 +350,22 @@ build_report_json() {
         --argfile pvc "$DATA_DIR/pvc.json" \
         --argfile obc "$DATA_DIR/obc.json" \
         --argfile orphans "$DATA_DIR/orphans.json" \
-        'def pool_entries($p):
+        'def normalize_pool:
+            {
+                pool_name:(.pool_name // .name // "unknown"),
+                kb_used:(
+                    if (.kb_used? != null) then (.kb_used | tonumber)
+                    elif (.num_kb? != null) then (.num_kb | tonumber)
+                    elif (.stored? != null) then ((.stored | tonumber) / 1024)
+                    elif (.num_bytes? != null) then ((.num_bytes | tonumber) / 1024)
+                    elif (.stats? and (.stats.kb_used? != null)) then (.stats.kb_used | tonumber)
+                    else 0 end
+                )
+            };
+        def pool_entries($p):
             ($p.pool_stats // []) as $stats
             | (if ($stats | length) > 0 then [] else ($p.pools // []) end) as $legacy
-            | ($stats + ($legacy | map({pool_name:(.pool_name // .name // "unknown"), kb_used:(.kb_used // .stats.kb_used // 0)})));
+            | ( ($stats | map(normalize_pool)) + ($legacy | map(normalize_pool)) );
         {
             generated_at:$generated,
             output_dir:$output,
