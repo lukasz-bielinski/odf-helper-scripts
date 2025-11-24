@@ -123,7 +123,11 @@ collect_ceph_cluster() {
     local health osds mons total_bytes used_bytes stored_bytes
     health=$(jq -r '.health.status // "unknown"' "$DATA_DIR/ceph-status.json")
     osds=$(jq '.osdmap.num_osds // 0' "$DATA_DIR/ceph-status.json")
+    # Try multiple paths for MON count
     mons=$(jq '.monmap.mons | length // 0' "$DATA_DIR/ceph-status.json")
+    if [[ "$mons" == "0" ]]; then
+        mons=$(jq '.monmap.num_mons // 0' "$DATA_DIR/ceph-status.json")
+    fi
     
     # Extract capacity from Prometheus metrics
     total_bytes=$(extract_metric_value "$(cat "$DATA_DIR/prom-cluster-total.json")")
@@ -215,23 +219,40 @@ collect_ceph_cluster() {
 collect_rbd_data() {
     section "RBD Pools & Images"
     
-    # Get RBD pools from Prometheus metadata
+    # Get RBD pools - try multiple methods
     local pools
-    pools=$(jq -r '.data.result[]? | select(.metric.type == "replicated" or .metric.type == "erasure") | .metric.name // .metric.pool_name' \
-        "$DATA_DIR/prom-pool-metadata.json" 2>/dev/null | grep -iE 'rbd|block' | sort -u || echo "")
     
-    # Fallback to ceph command if Prometheus doesn't have pool data
+    # Method 1: From Prometheus metadata
+    if [[ -f "$DATA_DIR/prom-pool-metadata.json" ]]; then
+        pools=$(jq -r '.data.result[]? | .metric.name // .metric.pool_name // empty' \
+            "$DATA_DIR/prom-pool-metadata.json" 2>/dev/null | grep -iE 'rbd|block|cephblock' | sort -u || echo "")
+    fi
+    
+    # Method 2: From top pools (we know cephblockpool exists!)
+    if [[ -z "$pools" ]] && [[ -f "$DATA_DIR/prom-pool-bytes-used.json" ]] && [[ -f "$DATA_DIR/prom-pool-metadata.json" ]]; then
+        # Get all pool names and filter for RBD
+        pools=$(jq -r --slurpfile metadata "$DATA_DIR/prom-pool-metadata.json" '
+            ($metadata[0].data.result | map(select(.metric.pool_id != null and .metric.name != null)) | 
+             map({key: .metric.pool_id, value: .metric.name}) | from_entries) as $pool_map |
+            .data.result[]? | $pool_map[.metric.pool_id] // empty
+        ' "$DATA_DIR/prom-pool-bytes-used.json" 2>/dev/null | grep -iE 'rbd|block|cephblock' | sort -u || echo "")
+    fi
+    
+    # Method 3: Fallback to ceph command
     if [[ -z "$pools" ]]; then
-        pools=$(rook_exec ceph osd pool ls --format json 2>/dev/null | jq -r '.[]' | grep -iE 'rbd|block' || true)
+        pools=$(rook_exec ceph osd pool ls --format json 2>/dev/null | jq -r '.[]' | grep -iE 'rbd|block|cephblock' || true)
     fi
     if [[ -z "$pools" ]]; then
-        pools=$(rook_exec ceph osd pool ls 2>/dev/null | tr -d '[]",' | tr ' ' '\n' | grep -iE 'rbd|block' || true)
+        pools=$(rook_exec ceph osd pool ls 2>/dev/null | tr -d '[]",' | tr ' ' '\n' | grep -iE 'rbd|block|cephblock' || true)
     fi
 
     if [[ -z "$pools" ]]; then
         append_line "No RBD pools detected"
+        append_line "Debug: Checked Prometheus metadata and ceph commands"
         return
     fi
+    
+    append_line "Found RBD pools: $(echo "$pools" | tr '\n' ' ')"
 
     local total_images=0
     local orphan_images=0
